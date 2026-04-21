@@ -56,9 +56,41 @@ These are assumed throughout the per-script notes below — not repeated each ti
 
 ## 1. `init.d/clashnivo` (fork of `init.d/openclash`)
 
-The procd init script. 4041 lines. Contains the full start/stop/reload
+The procd init script. Upstream: 4041 lines. Contains the full start/stop/reload
 pipeline, firewall rule generation, DNS hijacking, watchdog supervision, and
 cron scheduling.
+
+### Audit status (2026-04-21)
+
+Fork exists at `root/etc/init.d/clashnivo` — **2258 lines (56% of upstream)**.
+Audited against the plan below:
+
+- All string substitutions applied exhaustively — only 2 remaining references
+  to `OpenClash` (attribution header; coexistence-guard comment), both
+  intentional.
+- TUN mode branches collapsed; `do_run_mode()` accepts only `fake-ip` /
+  `redir-host`.
+- chnroute, streaming, SSR, smart/LightGBM, IPv6 rule emission all removed.
+- UCI reads match `uci-schema.md` — no references to dropped options.
+- Dnsmasq coexistence guard implemented in `save_dnsmasq_server()`.
+- **geoasn dropped in audit:** cron entry, `get_config()` read, and arg passed
+  to `clashnivo_yml_change.sh` removed — geoasn is deferred to Epic 5 with
+  the rest of GEO auto-update, and the v1 scope is Mihomo's bundled files.
+
+**Remaining polish (not Epic 0 blockers):**
+
+- ~30 log strings use full-width Chinese brackets `【...】`. Three of these
+  (watchdog reload-counter producer/parser pair) are machine-readable and
+  must be replaced together if touched.
+- Chinese bracket cleanup tracked as a single Epic 5 polish ticket — not
+  worth doing piecewise.
+
+**Blockers moved to dependent scripts:**
+
+- `clashnivo_yml_change.sh` fork must accept 32 positional args (upstream was
+  33, geoasn dropped). Verify at fork time.
+- `clashnivo_yml_rules_change.sh` fork must accept 7 positional args, none
+  smart/LightGBM related.
 
 ### Keep verbatim (string substitution only)
 
@@ -146,7 +178,30 @@ dependencies dropped are `openclash_chnroute.sh`,
 
 ## 2. `clashnivo.sh` (fork of `openclash.sh`)
 
-Subscription download + assembly orchestrator. 460 lines.
+Subscription download + assembly orchestrator. Upstream: 460 lines.
+
+### Audit status (2026-04-21)
+
+Fork exists at `root/usr/share/clashnivo/clashnivo.sh` — **447 lines**. Applied:
+
+- All paths / UCI config / script sourcing / lock file renamed.
+- `CLASH` binary path points at `/etc/clashnivo/core/mihomo`, matching init.d.
+- `pidof clash` → `pidof mihomo`.
+- procd signals target `clashnivo` / `clashnivo-watchdog`.
+- `kill_streaming_unlock()` function and its single call site (inside
+  `config_download_direct`) removed.
+- `only_download=1` flag removed — ruby-failure path now just logs and falls
+  through to `config_su_check`; `config_cus_up()` is always attempted (a
+  second ruby failure logs but causes no lasting damage).
+- All `【...】` log brackets replaced with `[...]`; final "分别获取订阅信息进行处理" comment translated.
+- `clashnivo_urlencode.lua` copied verbatim (12-line wrapper over
+  `HTTP.urlencode`; no openclash references to rename).
+
+**Soft dependency:** `/usr/share/clashnivo/res/sub_ini.list` referenced on line
+407 — not yet forked. Upstream file is a 40-row CSV of sub-converter template
+presets with Chinese labels. Script degrades gracefully when missing (grep
+returns empty, falls through to direct URL), so Epic 0 is not blocked. Forking
+this with English labels is an Epic 2 (subscription management) item.
 
 ### Keep
 

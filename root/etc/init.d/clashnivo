@@ -47,9 +47,6 @@ add_cron()
    [ -z "$(grep "clashnivo_geoip.sh" "$CRON_FILE" 2>/dev/null)" ] && {
       [ "$(uci_get_config "geoip_auto_update")" -eq 1 ] && echo "0 $(uci_get_config "geoip_update_day_time" || 1) * * $(uci_get_config "geoip_update_week_time" || 0) /usr/share/clashnivo/clashnivo_geoip.sh #clashnivo-cron-task" >> $CRON_FILE
    }
-   [ -z "$(grep "clashnivo_geoasn.sh" "$CRON_FILE" 2>/dev/null)" ] && {
-      [ "$(uci_get_config "geoasn_auto_update")" -eq 1 ] && echo "0 $(uci_get_config "geoasn_update_day_time" || 1) * * $(uci_get_config "geoasn_update_week_time" || 0) /usr/share/clashnivo/clashnivo_geoasn.sh #clashnivo-cron-task" >> $CRON_FILE
-   }
    [ -z "$(grep "/etc/init.d/clashnivo" "$CRON_FILE" 2>/dev/null)" ] && {
       [ "$(uci_get_config "auto_restart")" -eq 1 ] && echo "0 $(uci_get_config "auto_restart_day_time" || 1) * * $(uci_get_config "auto_restart_week_time" || 0) /etc/init.d/clashnivo restart #clashnivo-cron-task" >> $CRON_FILE
    }
@@ -77,7 +74,7 @@ save_dnsmasq_server() {
    # reverting dnsmasq, the snapshot would capture its 127.0.0.1#<port>
    # entry as "original" — restoring that on stop leaves a dead pointer.
    if echo "$1" | grep -q "^127\.0\.0\.1#"; then
-      LOG_WARN "Dnsmasq snapshot: discarding proxy-pointer server【$1】— likely stale state from a crashed proxy"
+      LOG_WARN "Dnsmasq snapshot: discarding proxy-pointer server [$1] — likely stale state from a crashed proxy"
       return
    fi
 
@@ -2037,7 +2034,6 @@ get_config()
    geo_custom_url=$(uci_get_config "geo_custom_url" || echo 0)
    geoip_custom_url=$(uci_get_config "geoip_custom_url" || echo 0)
    geosite_custom_url=$(uci_get_config "geosite_custom_url" || echo 0)
-   geoasn_custom_url=$(uci_get_config "geoasn_custom_url" || echo 0)
 
    [ -z "$dns_port" ] && dns_port=7974 && uci -q set clashnivo.config.dns_port=7974
    uci -q commit clashnivo
@@ -2077,7 +2073,7 @@ start_service()
          "$interface_name" "$enable_tcp_concurrent" "$append_default_dns" "$enable_meta_sniffer_pure_ip" \
          "$find_process_mode" "$fakeip_range" "$enable_unified_delay" \
          "$enable_respect_rules" "$custom_fakeip_filter_mode" "$iptables_compat" "$disable_quic_go_gso" "$cors_allow" \
-         "$geo_custom_url" "$geoip_custom_url" "$geosite_custom_url" "$geoasn_custom_url"
+         "$geo_custom_url" "$geoip_custom_url" "$geosite_custom_url"
 
          /usr/share/clashnivo/clashnivo_yml_rules_change.sh \
          "$enable_custom_clash_rules" "$TMP_CONFIG_FILE" \

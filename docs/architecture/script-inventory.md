@@ -271,7 +271,137 @@ product boundary and is settled in `docs/decision/0001-product-boundary.md`.
 
 ---
 
-## 5. `yml_rules_change.sh` (fork — pruning)
+## 5. `yml_change.sh` (fork — pruning)
+
+807 lines. Stage 7 global-config modifier. Takes ~47 positional arguments
+from `init.d/clashnivo` `start_service()` and mutates the assembled YAML
+in place: top-level fields (ports, mode, log-level, external-controller,
+secret, external-ui, ipv6, geodata), the entire `dns:` block (including
+custom nameserver / fallback / default-nameserver / proxy-server-nameserver /
+direct-nameserver / nameserver-policy / proxy-server-nameserver-policy /
+fake-ip-filter / use-hosts), the sniffer block, the TUN block, NTP, and
+`authentication`. Uses Ruby threads for parallel section work.
+
+### Keep
+
+- Shell helpers `yml_auth_get` (authentication list build),
+  `yml_dns_custom`, `sys_dns_append`, `yml_dns_get` (DNS server list
+  assembly from UCI `dns_servers` sections), `set_disable_qtype`.
+  These are the UCI → temp-file loaders that feed the Ruby block.
+- Top-level config writes: ports (`redir-port`, `tproxy-port`, `port`,
+  `socks-port`, `mixed-port`), `mode`, `log-level`, `allow-lan`,
+  `external-controller`, `secret`, `bind-address`, `ipv6`,
+  `interface-name`, `geodata-mode`, `geodata-loader`, `tcp-concurrent`,
+  `unified-delay`, `find-process-mode`, `experimental.quic-go-disable-gso`,
+  `external-controller-cors`, `profile.store-selected`,
+  `profile.store-fake-ip`, keep-alive defaults, `routing-mark`,
+  `auto-redir`/`iptables`/`ebpf` deletion, NTP defaults.
+- DNS pipeline: `enhanced-mode` (fake-ip / redir-host), `fake-ip-range`,
+  `dns.listen`, `dns.respect-rules`, `dns.enable`, `dns.ipv6`.
+- Custom DNS merging from `/tmp/yaml_config.{namedns,falldns,defaultdns,
+  proxynamedns,directnamedns}.yaml`.
+- `custom_name_policy`, `custom_proxy_server_policy` merges from custom
+  list files.
+- `custom_fakeip_filter` merge from
+  `/etc/clashnivo/custom/clashnivo_custom_fake_filter.list` (user-driven
+  only — see Drop).
+- `custom_host` hosts injection and `dns.use-hosts = true`.
+- Sniffer block (`enable_sniffer`, `append_sniffer_config`,
+  `sniffer_parse_pure_ip`) plus merge from
+  `/etc/clashnivo/custom/clashnivo_custom_sniffer.yaml`.
+- TUN block emission (`en_mode_tun`, `stack_type`). Kept for
+  completeness even though Epic 0 defaults to non-TUN — the flag still
+  selects between base `fake-ip` and `redir-host` stacks per the pruned
+  `do_run_mode()` in init.d §1.
+- DNS loop check and default-nameserver bootstrap (~lines 720–802).
+- `authentication` from `/tmp/yaml_openclash_auth` → rename temp file to
+  `/tmp/yaml_clashnivo_auth`.
+- `geo_custom_url`, `geoip_custom_url`, `geosite_custom_url` — kept for
+  the Epic 5 GEO-update path.
+
+### Drop
+
+- LightGBM: `lgbm_auto_update`, `lgbm_custom_url`, `lgbm_update_interval`,
+  `smart_collect`, `smart_collect_size` (positional args `${41}`–`${45}`).
+- chnroute: `china_ip_route`, `china_ip6_route` UCI reads, the
+  `process_pass_list` helper (~lines 39–68), and the fake-ip-filter
+  auto-geosite:cn / `GEOSITE,cn,real-ip` injection block (~lines
+  659–680). Without chnroute the fake-ip-filter is purely user-driven.
+- IPv6 fake-ip: `fake_ip_range6`, `fake_ip_range6_enable` (args `${46}`,
+  `${47}`) and the `dns.fake-ip-range6` write.
+- `ipv6_mode` branch of the TUN-enable condition (`['2','3'].include?
+  (ipv6_mode)`) — collapses to `en_mode_tun != '0'`.
+- `geoasn_custom_url` (arg `${40}`) — no geoasn cron in Clash Nivo.
+- IPv6 DNS: `wan6_dns` / `wan6_gate` calls in `sys_dns_append` and the
+  `dns_ipv6` argument (arg `${16}`). Collapses to IPv4-only WAN DNS
+  auto-append.
+- `custom_fallback_filter` (arg `$custom_fallback_filter`) and the
+  `/etc/openclash/custom/openclash_custom_fallback_filter.yaml` read.
+  Deprecated in recent Mihomo; not worth carrying forward.
+- Dashboard selector: drop `default_dashboard`, `yacd_type`,
+  `dashboard_type` UCI reads and the four-branch `case` emitting
+  `external-ui-url` (lines ~413–431). Hard-code `external-ui-name =
+  metacubexd` and the metacubexd release URL. The LuCI UI is the primary
+  surface; the mihomo-bundled dashboard is a secondary debug view and
+  does not need to be user-selectable.
+- Chinese log strings throughout every `YAML.LOG_TIP` / `LOG_ERROR`.
+
+### Rewrite
+
+- **Argument contract.** 47 positional args → ~28 after the drops above.
+  Re-number and document the surviving contract at the top of the
+  forked file; keep the `init.d` call site in lock-step.
+  Candidate ordering (to be finalised during the fork ticket):
+  `$1` fake-ip-mode, `$2` secret, `$3` controller-port, `$4` redir-port,
+  `$5` CONFIG_FILE, `$6` enable-ipv6, `$7` http-port, `$8` socks-port,
+  `$9` log-level, `${10}` mode, `${11}` en_mode_tun, `${12}` stack-type,
+  `${13}` dns-listen-port, `${14}` mixed-port, `${15}` tproxy-port,
+  `${16}` store-fake-ip, `${17}` enable-sniffer, `${18}` geodata-mode,
+  `${19}` geodata-loader, `${20}` append-sniffer-config,
+  `${21}` interface-name, `${22}` tcp-concurrent,
+  `${23}` add-default-from-dns, `${24}` sniffer-parse-pure-ip,
+  `${25}` find-process-mode, `${26}` fake-ip-range,
+  `${27}` unified-delay, `${28}` respect-rules, `${29}` fake-ip-filter-mode,
+  `${30}` routing-mark-setting, `${31}` quic-gso, `${32}` cors-origin,
+  `${33}` geo-custom-url, `${34}` geoip-custom-url,
+  `${35}` geosite-custom-url.
+- Custom-list paths: `/etc/openclash/custom/openclash_custom_*` →
+  `/etc/clashnivo/custom/clashnivo_custom_*` across
+  `openclash_custom_fake_filter.list`, `openclash_custom_hosts.list`,
+  `openclash_custom_sniffer.yaml`, `openclash_custom_domain_dns_policy.list`,
+  `openclash_custom_proxy_server_dns_policy.list`.
+- Temp-file paths: `/tmp/yaml_openclash_*` → `/tmp/yaml_clashnivo_*`
+  (auth file, fake_filter_include).
+- `external-ui` path: `/usr/share/openclash/ui` →
+  `/usr/share/clashnivo/ui`.
+- Ruby `-I` include path: `/usr/share/openclash` →
+  `/usr/share/clashnivo`.
+- `LOG_FILE` default: `/tmp/openclash.log` → `/tmp/clashnivo.log`.
+- `openclash_get_network.lua` invocations in `sys_dns_append` →
+  `clashnivo_get_network.lua`; drop the `dns6` / `gateway6` calls.
+- `config_load "openclash"` → `config_load "clashnivo"`.
+
+### Risk notes
+
+- **Positional argument contract is the fragile part.** The script reads
+  up to `${47}`. Pruning means renumbering, and every renumber has to
+  land atomically with the init-script call site. A mismatch is silent
+  — Ruby reads the wrong variable, the config gets a wrong value, and
+  only a run-time behavioural difference surfaces it. Recommend
+  converting to named env vars during the fork rather than keeping
+  positional args, but that is a larger refactor; flag as a follow-up.
+- In-place YAML mutation via `File.open(config_file, 'w') { |f|
+  YAML.dump(Value, f) }` in the `ensure` block — same thread-exception
+  corruption risk as §6 (`yml_rules_change.sh`). Confirm the `ensure`
+  path still runs on thread-raised exceptions after the prune.
+- The `proxy-server-nameserver` auto-defaulting logic (~lines 771–799)
+  is subtle and load-bearing for `respect-rules` and proxy DNS
+  resolution. Do not prune it; keep as-is modulo the log-string
+  substitution.
+
+---
+
+## 6. `yml_rules_change.sh` (fork — pruning)
 
 420 lines. Embedded Ruby block that mutates the assembled config: prepends
 BT/PT DIRECT rules, prepends custom rules from
@@ -306,7 +436,7 @@ url-test intervals.
 
 ---
 
-## 6. `clashnivo_core.sh` (fork of `openclash_core.sh`)
+## 7. `clashnivo_core.sh` (fork of `openclash_core.sh`)
 
 Downloads the Mihomo binary. 187 lines.
 
@@ -344,7 +474,7 @@ Downloads the Mihomo binary. 187 lines.
 
 ---
 
-## 7. `clashnivo_version.sh` (fork of `openclash_version.sh`)
+## 8. `clashnivo_version.sh` (fork of `openclash_version.sh`)
 
 66 lines. Checks the latest luci-app package version. Trivial to fork.
 
@@ -357,7 +487,7 @@ Downloads the Mihomo binary. 187 lines.
 
 ---
 
-## 8. `clashnivo_update.sh` (fork of `openclash_update.sh`)
+## 9. `clashnivo_update.sh` (fork of `openclash_update.sh`)
 
 388 lines. Self-updates the LuCI package via opkg/apk.
 
@@ -379,7 +509,7 @@ Downloads the Mihomo binary. 187 lines.
 
 ---
 
-## 9. `clashnivo_watchdog.sh` (fork of `openclash_watchdog.sh`)
+## 10. `clashnivo_watchdog.sh` (fork of `openclash_watchdog.sh`)
 
 431 lines. 60-second loop: health-checks Mihomo, maintains firewall rules,
 keeps dnsmasq hijack, syncs localnetwork sets, maintains UPNP leases.
@@ -417,7 +547,7 @@ keeps dnsmasq hijack, syncs localnetwork sets, maintains UPNP leases.
 
 ---
 
-## 10. Direct copies
+## 11. Direct copies
 
 These files need only string substitution and the standard path renames.
 No logic review required beyond the notes below.

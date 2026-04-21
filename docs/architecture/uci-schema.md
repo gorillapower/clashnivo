@@ -475,24 +475,29 @@ One section per DNS upstream. Emitted into `config.yaml` `dns:` block at Stage
 
 ## 6. `config_overwrite` (0..N named sections)
 
-One section per overwrite source. Consumed by `yml_rules_change.sh` /
-`ruby_merge` at Stage 6.
+One section per overwrite source. Consumed at Stage 6 by init.d's
+`overwrite_file()`, which emits `/tmp/yaml_overwrite.sh` and runs it against
+the assembled config.
 
 | Key | Type | Default | Purpose |
 |---|---|---|---|
 | `enabled` | bool | `0` | Apply this overwrite |
-| `name` | string | required | Display name |
-| `type` | enum | `http` | `http` (remote URL) \| `inline` (inline YAML) |
+| `name` | string | required | Display name + on-disk filename (see below). `[%w][%w._%-]*` |
+| `type` | enum | `inline` | `inline` (body authored in the CBI) \| `http` (remote URL, cron-fetched) |
+| `config` | string | `all` | Scope: `all` or a specific config basename under `/etc/clashnivo/config/` |
 | `url` | URL | — | Source URL (for `type=http`) |
-| `order` | int | `1` | Application order (lower first; later overwrites win) |
+| `order` | uint | `1` | Application order (lower runs first; later overwrites override earlier ones key-for-key) |
 | `update_days` | int \| `off` | `off` | Auto-update day-of-month (`1`..`31` or `off`) |
 | `update_hour` | int \| `off` | `off` | Auto-update hour (`0`..`23` or `off`) |
-| `param` | string (`key=value;...`) | — | Semicolon-delimited knobs passed to the overwrite script |
+| `param` | string (`key=value;...`) | — | Semicolon-delimited knobs exported as env vars before the overwrite script runs |
 
-OpenClash keeps overwrite content in `/etc/openclash/custom/openclash_custom_*.yaml`
-files. The UCI entry indexes them; the file contents are edited separately
-through the CBI text editor. Preserve this file-on-disk pattern for Clash
-Nivo (`/etc/clashnivo/custom/clashnivo_custom_*.yaml`).
+**On-disk body**: `/etc/clashnivo/overwrite/<name>`. This matches the
+OpenClash init.d path we forked from (`/etc/openclash/overwrite/<name>`) —
+it's the path `overwrite_file()` actually reads. The file format is
+OpenClash's `.ini`-style with `[General]` / `[Overwrite]` / `[YAML]` blocks;
+the v1 CBI only exposes authoring of the `[YAML]` block (inline body is
+saved wrapped as `[YAML]\n<body>`). Remote `http` sources are stored as
+downloaded and may use any of the three sections.
 
 ---
 

@@ -8,7 +8,7 @@ Scope status:
   - Epic 3a (custom servers + URL import) — implemented.
   - Epic 3b (custom groups) — implemented.
   - Epic 3c (custom rules + rule providers) — implemented.
-  - Epic 3d (config overwrite) — routes stubbed.
+  - Epic 3d (config overwrite) — implemented.
   - Epic 4 (core binary mgmt) — routes stubbed.
   - Epic 5 (diagnostics, flush DNS) — routes stubbed.
   - OpenClash features cut in v1 (streaming unlock, smart/LightGBM, chnroute,
@@ -46,6 +46,9 @@ function index()
 	-- Epic 3c pages
 	entry({"admin", "services", "clashnivo", "custom-rules"},        cbi("clashnivo/custom-rules"),        _("Custom Rules"),  70).leaf = true
 	entry({"admin", "services", "clashnivo", "custom-rules-edit"},   cbi("clashnivo/custom-rules-edit"),   nil).leaf = true
+	-- Epic 3d pages
+	entry({"admin", "services", "clashnivo", "config-overwrite"},      cbi("clashnivo/config-overwrite"),      _("Config Overwrite"), 80).leaf = true
+	entry({"admin", "services", "clashnivo", "config-overwrite-edit"}, cbi("clashnivo/config-overwrite-edit"), nil).leaf = true
 	entry({"admin", "services", "clashnivo", "log"},               cbi("clashnivo/log"),               _("Logs"),          90).leaf = true
 
 	-- Epic 1 AJAX endpoints (implemented)
@@ -77,7 +80,10 @@ function index()
 	-- Epic 3a AJAX endpoints
 	entry({"admin", "services", "clashnivo", "import_servers"},       call("action_import_servers")).leaf = true
 
-	-- Epic 3 (groups/rules/overwrite) — routes stubbed
+	-- Epic 3d AJAX endpoints
+	entry({"admin", "services", "clashnivo", "config_overwrite_preview"}, call("action_config_overwrite_preview")).leaf = true
+
+	-- Epic 3 leftovers (no UI for file-level overwrite management in v1)
 	entry({"admin", "services", "clashnivo", "overwrite_subscribe_info"}, call("stub_not_implemented"))
 	entry({"admin", "services", "clashnivo", "overwrite_file_list"},  call("stub_not_implemented"))
 	entry({"admin", "services", "clashnivo", "delete_overwrite_file"}, call("stub_not_implemented"))
@@ -1184,5 +1190,146 @@ function action_import_servers()
 		added   = added,
 		skipped = skipped,
 		errors  = errors,
+	})
+end
+
+-- ---------------------------------------------------------------------------
+-- Epic 3d: config overwrite — diff preview
+--
+-- Applies the overwrite section identified by `sid` to a scratch copy of the
+-- active config and returns a unified diff. Inline sources are merged directly
+-- via YAML.overwrite; http sources aren't previewed here (they'd require a
+-- live download from the CBI request).
+-- ---------------------------------------------------------------------------
+
+-- Shell-single-quote escape. Wrap the result in `'...'`.
+local function shq(s)
+	return (tostring(s or ""):gsub("'", "'\\''"))
+end
+
+local function strip_yaml_block(text)
+	if not text or text == "" then return "" end
+	local out, in_yaml = {}, false
+	for line in (text .. "\n"):gmatch("([^\n]*)\n") do
+		local trimmed = line:match("^%s*(.-)%s*$")
+		if trimmed == "[YAML]" then
+			in_yaml = true
+		elseif trimmed:match("^%[.*%]$") then
+			in_yaml = false
+		elseif in_yaml then
+			table.insert(out, line)
+		end
+	end
+	return table.concat(out, "\n")
+end
+
+function action_config_overwrite_preview()
+	luci.http.prepare_content("application/json")
+	local sid = luci.http.formvalue("sid")
+	if not sid or uci:get("clashnivo", sid) ~= "config_overwrite" then
+		luci.http.write_json({ status = "error", message = "Invalid overwrite section" })
+		return
+	end
+
+	local t = uci:get("clashnivo", sid, "type") or "inline"
+	if t ~= "inline" then
+		luci.http.write_json({
+			status  = "error",
+			message = "Preview is only available for inline sources"
+		})
+		return
+	end
+
+	local name = uci:get("clashnivo", sid, "name") or ""
+	if name == "" or not string.match(name, "^[%w][%w._%-]*$") then
+		luci.http.write_json({ status = "error", message = "Set a valid Name and save first" })
+		return
+	end
+
+	local cfg_path = fs.uci_get_config("config", "config_path") or ""
+	if cfg_path == "" or not fs.access(cfg_path) then
+		luci.http.write_json({
+			status  = "error",
+			message = "No active config (run a subscription download first)"
+		})
+		return
+	end
+
+	local nxfs = require "nixio.fs"
+	local body_path = "/etc/clashnivo/overwrite/" .. name
+	local body = nxfs.readfile(body_path)
+	if not body or body == "" then
+		luci.http.write_json({
+			status  = "error",
+			message = "Inline body is empty — save the section to write it to disk first"
+		})
+		return
+	end
+	body = strip_yaml_block(body)
+	if body == "" then
+		luci.http.write_json({ status = "success", diff = "" })
+		return
+	end
+
+	-- Scratch copies. Preview is read-only — don't touch the live config.
+	local stamp  = tostring(os.time()) .. "_" .. tostring(math.random(10000, 99999))
+	local src    = "/tmp/clashnivo_preview_src_" .. stamp .. ".yaml"
+	local dst    = "/tmp/clashnivo_preview_dst_" .. stamp .. ".yaml"
+	local overlay = "/tmp/clashnivo_preview_overlay_" .. stamp .. ".yaml"
+
+	luci.sys.call(string.format("cp '%s' '%s'", shq(cfg_path), shq(src)))
+	luci.sys.call(string.format("cp '%s' '%s'", shq(cfg_path), shq(dst)))
+
+	if not nxfs.writefile(overlay, body) then
+		os.remove(src); os.remove(dst)
+		luci.http.write_json({ status = "error", message = "Could not write scratch overlay" })
+		return
+	end
+
+	local ruby_cmd = string.format(
+		"ruby -ryaml -rYAML -I '/usr/share/clashnivo' -E UTF-8 -e \""
+		.. "begin;"
+		.. "  Value = YAML.load_file('%s');"
+		.. "  overlay = YAML.load_file('%s');"
+		.. "  if overlay.is_a?(Hash);"
+		.. "    result = YAML.overwrite(Value, overlay);"
+		.. "    File.open('%s', 'w') { |f| YAML.dump(result, f) };"
+		.. "  end;"
+		.. "rescue => e;"
+		.. "  STDERR.puts(\\\"overlay failed: #{e.message}\\\");"
+		.. "  exit 2;"
+		.. "end\" 2>&1",
+		shq(dst), shq(overlay), shq(dst)
+	)
+
+	local ruby_out = luci.sys.exec(ruby_cmd) or ""
+	local diff_out = luci.sys.exec(string.format(
+		"diff -u '%s' '%s' 2>/dev/null",
+		shq(src), shq(dst)
+	)) or ""
+
+	os.remove(src); os.remove(dst); os.remove(overlay)
+
+	if ruby_out:match("overlay failed") then
+		luci.http.write_json({
+			status  = "error",
+			message = "YAML merge failed: " .. ruby_out
+		})
+		return
+	end
+
+	-- Strip diff's `--- file1` / `+++ file2` header lines so the on-disk
+	-- scratch paths don't leak into the UI.
+	local cleaned = {}
+	for line in (diff_out .. "\n"):gmatch("([^\n]*)\n") do
+		if not (line:match("^%-%-%- ") or line:match("^%+%+%+ ")) then
+			table.insert(cleaned, line)
+		end
+	end
+	while #cleaned > 0 and cleaned[#cleaned] == "" do table.remove(cleaned) end
+
+	luci.http.write_json({
+		status = "success",
+		diff   = table.concat(cleaned, "\n"),
 	})
 end

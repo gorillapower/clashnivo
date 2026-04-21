@@ -1,0 +1,56 @@
+<%+cbi/valueheader%>
+<div class="cbi-section">
+	<h3><%:Import From URL%></h3>
+	<div class="cbi-section-descr">
+		<%:Paste one or more proxy URIs (ss://, vmess://, vless://, trojan://, hysteria2://), one per line. Each recognised URI becomes a server entry.%>
+	</div>
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:URIs%></label>
+		<div class="cbi-value-field">
+			<textarea id="cn_server_uris" rows="6" style="width:95%;font-family:monospace"
+				placeholder="ss://... &#10;vmess://... &#10;vless://..."></textarea>
+		</div>
+	</div>
+	<div class="cbi-value">
+		<label class="cbi-value-title">&nbsp;</label>
+		<div class="cbi-value-field">
+			<input type="button" class="btn cbi-button cbi-button-apply"
+				value="<%:Import%>" onclick="cn_import_servers()" />
+			<span id="cn_server_import_result" style="margin-left:1em"></span>
+		</div>
+	</div>
+</div>
+<script type="text/javascript">//<![CDATA[
+	function cn_import_servers() {
+		var ta  = document.getElementById('cn_server_uris');
+		var out = document.getElementById('cn_server_import_result');
+		var raw = (ta && ta.value) || '';
+		if (raw.replace(/\s+/g, '') === '') {
+			out.innerHTML = '<span style="color:#c33"><%:Paste at least one URI%></span>';
+			return;
+		}
+		out.innerHTML = '<%:Importing...%>';
+		var xhr = new XMLHttpRequest();
+		xhr.open('POST',
+			'<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "import_servers")%>', true);
+		xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+		xhr.onreadystatechange = function() {
+			if (xhr.readyState !== 4) return;
+			try {
+				var r = JSON.parse(xhr.responseText);
+				if (r.status === 'success') {
+					out.innerHTML = '<span style="color:#090"><%:Imported%>: ' + r.added +
+						(r.skipped ? ' &nbsp; <%:Skipped%>: ' + r.skipped : '') + '</span>';
+					ta.value = '';
+					window.setTimeout(function() { window.location.reload(); }, 800);
+				} else {
+					out.innerHTML = '<span style="color:#c33">' + (r.message || '<%:Import failed%>') + '</span>';
+				}
+			} catch (e) {
+				out.innerHTML = '<span style="color:#c33"><%:Import failed%></span>';
+			}
+		};
+		xhr.send('uris=' + encodeURIComponent(raw));
+	}
+//]]></script>
+<%+cbi/valuefooter%>

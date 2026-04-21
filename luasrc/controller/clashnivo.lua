@@ -5,7 +5,9 @@ and trimmed heavily.
 Scope status:
   - Epic 1 (overview + settings shell + log viewer) — implemented.
   - Epic 2 (subscription mgmt + config file manager) — implemented.
-  - Epic 3 (custom servers/groups/rules/overwrite) — routes stubbed.
+  - Epic 3a (custom servers + URL import) — implemented.
+  - Epic 3b (custom groups) — implemented.
+  - Epic 3c/3d (custom rules/overwrite) — routes stubbed.
   - Epic 4 (core binary mgmt) — routes stubbed.
   - Epic 5 (diagnostics, flush DNS) — routes stubbed.
   - OpenClash features cut in v1 (streaming unlock, smart/LightGBM, chnroute,
@@ -34,6 +36,12 @@ function index()
 	entry({"admin", "services", "clashnivo", "subscription"},      cbi("clashnivo/subscription"),      _("Subscriptions"), 30).leaf = true
 	entry({"admin", "services", "clashnivo", "subscription-edit"}, cbi("clashnivo/subscription-edit"), nil).leaf = true
 	entry({"admin", "services", "clashnivo", "config"},            cbi("clashnivo/config"),            _("Config Files"),  40).leaf = true
+	-- Epic 3a pages
+	entry({"admin", "services", "clashnivo", "custom-servers"},      cbi("clashnivo/custom-servers"),      _("Custom Servers"), 50).leaf = true
+	entry({"admin", "services", "clashnivo", "custom-servers-edit"}, cbi("clashnivo/custom-servers-edit"), nil).leaf = true
+	-- Epic 3b pages
+	entry({"admin", "services", "clashnivo", "custom-groups"},       cbi("clashnivo/custom-groups"),       _("Custom Groups"), 60).leaf = true
+	entry({"admin", "services", "clashnivo", "custom-groups-edit"},  cbi("clashnivo/custom-groups-edit"),  nil).leaf = true
 	entry({"admin", "services", "clashnivo", "log"},               cbi("clashnivo/log"),               _("Logs"),          90).leaf = true
 
 	-- Epic 1 AJAX endpoints (implemented)
@@ -62,7 +70,10 @@ function index()
 	entry({"admin", "services", "clashnivo", "update_config"},        call("action_update_config")).leaf = true
 	entry({"admin", "services", "clashnivo", "get_subscribe_data"},   call("action_get_subscribe_data")).leaf = true
 
-	-- Epic 3 (custom servers/groups/rules/overwrite) — routes stubbed
+	-- Epic 3a AJAX endpoints
+	entry({"admin", "services", "clashnivo", "import_servers"},       call("action_import_servers")).leaf = true
+
+	-- Epic 3 (groups/rules/overwrite) — routes stubbed
 	entry({"admin", "services", "clashnivo", "overwrite_subscribe_info"}, call("stub_not_implemented"))
 	entry({"admin", "services", "clashnivo", "overwrite_file_list"},  call("stub_not_implemented"))
 	entry({"admin", "services", "clashnivo", "delete_overwrite_file"}, call("stub_not_implemented"))
@@ -834,5 +845,340 @@ function action_add_subscription()
 		status  = "success",
 		message = existing and "Subscription updated" or "Subscription added",
 		name    = name
+	})
+end
+
+-- ---------------------------------------------------------------------------
+-- Epic 3a: custom servers — URL import
+--
+-- Parses ss:// / vmess:// / vless:// / trojan:// / hysteria2:// URIs and
+-- creates one `servers` UCI section per recognised entry. Failures are
+-- counted and returned as `skipped`; success is a committed transaction.
+--
+-- Scope cuts vs OpenClash:
+--   * Only the five v1 protocols (no ssr://, tuic://, wg://, etc.).
+--   * No client-side JS decoder — parsing is server-side, straight into UCI.
+--   * No dedup against existing entries; re-importing will append duplicates
+--     (user can delete from the list view).
+-- ---------------------------------------------------------------------------
+
+-- Percent-decode a URL component.
+local function urldecode(s)
+	if not s then return "" end
+	s = s:gsub("+", " ")
+	s = s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+	return s
+end
+
+-- URL-safe + standard Base64 decode, tolerant of missing padding. Uses
+-- `nixio.bin.b64decode` when available (it is on OpenWrt LuCI) and falls
+-- back to a pure-Lua decoder for test environments.
+local function b64decode(data)
+	if not data or data == "" then return nil end
+	data = data:gsub("-", "+"):gsub("_", "/"):gsub("%s", "")
+	local pad = 4 - (#data % 4)
+	if pad < 4 and pad > 0 then data = data .. string.rep("=", pad) end
+	local ok, nbin = pcall(require, "nixio")
+	if ok and nbin and nbin.bin and nbin.bin.b64decode then
+		local r = nbin.bin.b64decode(data)
+		if r then return r end
+	end
+	local alpha = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+	local buf, acc, bits = {}, 0, 0
+	for c in data:gmatch(".") do
+		if c == "=" then break end
+		local i = alpha:find(c, 1, true)
+		if not i then return nil end
+		acc  = acc * 64 + (i - 1)
+		bits = bits + 6
+		if bits >= 8 then
+			bits = bits - 8
+			local byte = math.floor(acc / (2 ^ bits))
+			acc = acc - byte * (2 ^ bits)
+			buf[#buf + 1] = string.char(byte)
+		end
+	end
+	return table.concat(buf)
+end
+
+-- Parse `key=value&key=value` query-string. Returns map.
+local function parse_query(q)
+	local t = {}
+	if not q or q == "" then return t end
+	for pair in q:gmatch("[^&]+") do
+		local k, v = pair:match("^([^=]+)=?(.*)$")
+		if k and k ~= "" then t[urldecode(k)] = urldecode(v or "") end
+	end
+	return t
+end
+
+-- Split `uri` into {scheme, body, fragment}.
+local function split_uri(uri)
+	local scheme, rest = uri:match("^(%w[%w+%-%.]*)://(.*)$")
+	if not scheme then return nil end
+	local body, frag = rest:match("^(.-)#(.*)$")
+	if not body then body, frag = rest, "" end
+	return scheme:lower(), body, urldecode(frag)
+end
+
+-- Helpers to split `userinfo@host:port?query` style bodies.
+local function split_userinfo(body)
+	local userinfo, host_part = body:match("^(.-)@(.+)$")
+	if not userinfo then return nil, body end
+	return userinfo, host_part
+end
+
+local function split_hostport_query(host_part)
+	local hostport, query = host_part:match("^(.-)%?(.*)$")
+	if not hostport then hostport, query = host_part, "" end
+	local host, port = hostport:match("^(.-):(%d+)$")
+	-- Handle bracketed IPv6: [::1]:443
+	if not host then
+		host, port = hostport:match("^%[(.-)%]:(%d+)$")
+	end
+	if not host then host, port = hostport, "" end
+	return host, port, query
+end
+
+-- Each parser returns a field-table or nil, errmsg.
+local parsers = {}
+
+-- ss:// — either SIP002 (ss://b64(method:pass)@host:port) or legacy
+-- (ss://b64(method:pass@host:port)#name).
+function parsers.ss(body, frag)
+	local userinfo, host_part = split_userinfo(body)
+	local fields = { type = "ss" }
+
+	if userinfo then
+		-- SIP002. userinfo may be base64 or plain "method:password".
+		local decoded = b64decode(userinfo) or urldecode(userinfo)
+		local method, password = decoded:match("^(.-):(.+)$")
+		if not method then return nil, "ss: bad userinfo" end
+		local host, port, query = split_hostport_query(host_part)
+		local q = parse_query(query)
+		fields.cipher   = method
+		fields.password = password
+		fields.server   = host
+		fields.port     = port
+		if q.plugin and q.plugin:find("obfs") then
+			fields.obfs = (q.plugin:match("obfs=([^;]+)")) or q.obfs
+			fields.host = q.plugin:match("obfs%-host=([^;]+)") or q.host
+		end
+	else
+		-- Legacy: whole URI base64-encoded.
+		local decoded = b64decode(body)
+		if not decoded then return nil, "ss: bad base64" end
+		local method, password, host, port = decoded:match("^(.-):(.-)@(.-):(%d+)$")
+		if not method then return nil, "ss: bad legacy format" end
+		fields.cipher, fields.password, fields.server, fields.port =
+			method, password, host, port
+	end
+
+	fields.name = (frag ~= "" and frag) or fields.server
+	return fields
+end
+
+-- vmess:// — Clash-style base64 JSON.
+function parsers.vmess(body)
+	local raw = b64decode(body)
+	if not raw then return nil, "vmess: bad base64" end
+	local ok, obj = pcall(json.parse, raw)
+	if not ok or type(obj) ~= "table" then return nil, "vmess: bad json" end
+
+	local fields = {
+		type       = "vmess",
+		name       = obj.ps or obj.add or "vmess",
+		server     = obj.add or "",
+		port       = tostring(obj.port or "443"),
+		uuid       = obj.id or "",
+		alterId    = tostring(obj.aid or "0"),
+		securitys  = obj.scy or "auto",
+		sni        = obj.sni or "",
+		servername = obj.sni or "",
+	}
+	if obj.tls == "tls" or obj.tls == true then fields.tls = "1" end
+	local net = obj.net or "tcp"
+	if     net == "ws"   then fields.obfs_vmess = "websocket"
+	elseif net == "http" then fields.obfs_vmess = "http"
+	elseif net == "h2"   then fields.obfs_vmess = "h2"
+	elseif net == "grpc" then fields.obfs_vmess = "grpc"
+	else                       fields.obfs_vmess = "none"
+	end
+	if obj.path and obj.path ~= "" then fields.ws_opts_path = obj.path end
+	if obj.host and obj.host ~= "" then
+		fields.ws_opts_headers = { "Host: " .. obj.host }
+	end
+	if obj.fp and obj.fp ~= "" then fields.client_fingerprint = obj.fp end
+	if obj.alpn and obj.alpn ~= "" then
+		fields.alpn = {}
+		for p in obj.alpn:gmatch("[^,]+") do table.insert(fields.alpn, p) end
+	end
+	return fields
+end
+
+-- vless:// — URI-style with query params.
+function parsers.vless(body, frag)
+	local userinfo, host_part = split_userinfo(body)
+	if not userinfo then return nil, "vless: missing uuid" end
+	local host, port, query = split_hostport_query(host_part)
+	local q = parse_query(query)
+
+	local fields = {
+		type       = "vless",
+		name       = (frag ~= "" and frag) or host,
+		uuid       = userinfo,
+		server     = host,
+		port       = port,
+		sni        = q.sni or q.peer or "",
+		servername = q.sni or q.peer or "",
+	}
+	if q.security == "tls" or q.security == "reality" then fields.tls = "1" end
+	if q.security == "reality" then
+		fields.reality_public_key = q.pbk or ""
+		fields.reality_short_id   = q.sid or ""
+	end
+	local net = q.type or "tcp"
+	if     net == "ws"    then fields.obfs_vless = "ws"
+	elseif net == "grpc"  then fields.obfs_vless = "grpc"
+	elseif net == "xhttp" then fields.obfs_vless = "xhttp"
+	else                        fields.obfs_vless = "tcp"
+	end
+	if q.path and q.path ~= "" then
+		fields.ws_opts_path   = q.path
+		fields.xhttp_opts_path = q.path
+	end
+	if q.host and q.host ~= "" then
+		fields.ws_opts_headers = { "Host: " .. q.host }
+		fields.xhttp_opts_host = q.host
+	end
+	if q.serviceName and q.serviceName ~= "" then fields.grpc_service_name = q.serviceName end
+	if q.flow and q.flow ~= "" then fields.vless_flow = q.flow end
+	if q.encryption and q.encryption ~= "" then fields.vless_encryption = q.encryption end
+	if q.fp and q.fp ~= "" then fields.client_fingerprint = q.fp end
+	return fields
+end
+
+-- trojan:// — URI-style.
+function parsers.trojan(body, frag)
+	local userinfo, host_part = split_userinfo(body)
+	if not userinfo then return nil, "trojan: missing password" end
+	local host, port, query = split_hostport_query(host_part)
+	local q = parse_query(query)
+
+	local fields = {
+		type     = "trojan",
+		name     = (frag ~= "" and frag) or host,
+		password = userinfo,
+		server   = host,
+		port     = port,
+		sni      = q.sni or q.peer or "",
+		tls      = "1",
+	}
+	if q.allowInsecure == "1" then fields.skip_cert_verify = "1" end
+	local net = q.type or "tcp"
+	if     net == "ws"   then fields.obfs_trojan = "ws"
+	elseif net == "grpc" then fields.obfs_trojan = "grpc"
+	else                        fields.obfs_trojan = "none"
+	end
+	if q.path and q.path ~= "" then fields.trojan_ws_path = q.path end
+	if q.host and q.host ~= "" then fields.trojan_ws_headers = { "Host: " .. q.host } end
+	if q.serviceName and q.serviceName ~= "" then fields.grpc_service_name = q.serviceName end
+	if q.alpn and q.alpn ~= "" then
+		fields.alpn = {}
+		for p in q.alpn:gmatch("[^,]+") do table.insert(fields.alpn, p) end
+	end
+	return fields
+end
+
+-- hysteria2:// — URI-style.
+function parsers.hysteria2(body, frag)
+	local userinfo, host_part = split_userinfo(body)
+	if not userinfo then return nil, "hy2: missing password" end
+	local host, port, query = split_hostport_query(host_part)
+	local q = parse_query(query)
+
+	local fields = {
+		type     = "hysteria2",
+		name     = (frag ~= "" and frag) or host,
+		password = userinfo,
+		server   = host,
+		port     = port,
+		sni      = q.sni or q.peer or "",
+	}
+	if q.insecure == "1" then fields.skip_cert_verify = "1" end
+	if q.obfs and q.obfs ~= "" then
+		fields.hysteria_obfs          = q.obfs
+		fields.hysteria_obfs_password = q["obfs-password"] or ""
+	end
+	if q.up   and q.up   ~= "" then fields.hysteria_up   = q.up   end
+	if q.down and q.down ~= "" then fields.hysteria_down = q.down end
+	if q.alpn and q.alpn ~= "" then
+		fields.hysteria_alpn = {}
+		for p in q.alpn:gmatch("[^,]+") do table.insert(fields.hysteria_alpn, p) end
+	end
+	if q.mport and q.mport ~= "" then fields.ports = q.mport end
+	return fields
+end
+parsers.hy2 = parsers.hysteria2
+
+-- Convert a parsed field table into a new `servers` UCI section.
+local function write_server(fields)
+	if not fields.server or fields.server == ""
+		or not fields.port or fields.port == ""
+		or not fields.name or fields.name == "" then
+		return false, "missing required fields"
+	end
+	local sid = uci:add("clashnivo", "servers")
+	if not sid then return false, "uci add failed" end
+	uci:set("clashnivo", sid, "enabled", "1")
+	uci:set("clashnivo", sid, "config", "all")
+	for k, v in pairs(fields) do
+		if type(v) == "table" then
+			if #v > 0 then uci:set_list("clashnivo", sid, k, v) end
+		elseif v ~= nil and v ~= "" then
+			uci:set("clashnivo", sid, k, tostring(v))
+		end
+	end
+	return true
+end
+
+function action_import_servers()
+	luci.http.prepare_content("application/json")
+	local raw = luci.http.formvalue("uris") or ""
+	if raw == "" then
+		luci.http.write_json({ status = "error", message = "No URIs provided" })
+		return
+	end
+
+	local added, skipped, errors = 0, 0, {}
+	for line in raw:gmatch("[^\r\n]+") do
+		local uri = line:match("^%s*(.-)%s*$")
+		if uri ~= "" and not uri:match("^#") then
+			local scheme, body, frag = split_uri(uri)
+			local parser = scheme and parsers[scheme]
+			if not parser then
+				skipped = skipped + 1
+				table.insert(errors, (scheme or "?") .. ": unsupported")
+			else
+				local fields, err = parser(body, frag)
+				if not fields then
+					skipped = skipped + 1
+					table.insert(errors, err or (scheme .. ": parse failed"))
+				else
+					local ok, werr = write_server(fields)
+					if ok then added = added + 1
+					else skipped = skipped + 1; table.insert(errors, werr) end
+				end
+			end
+		end
+	end
+
+	if added > 0 then uci:commit("clashnivo") end
+
+	luci.http.write_json({
+		status  = "success",
+		added   = added,
+		skipped = skipped,
+		errors  = errors,
 	})
 end

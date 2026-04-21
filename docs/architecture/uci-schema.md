@@ -31,11 +31,14 @@ them. Source reference is OpenClash at
 | `groups` | 0..N | named | One custom proxy group | `custom-groups.lua`, `custom-groups-edit.lua` |
 | `dns_servers` | 0..N | anonymous | One DNS upstream entry | `settings.lua` (DNS tab) |
 | `config_overwrite` | 0..N | named | One overwrite source | `config-overwrite.lua` |
+| `rule_provider` | 0..N | named | One rule-set provider (geoip/geosite/custom) | `custom-rules.lua` (shared page with rule items) |
 | `lan_ac_traffic` | 0..N | named | One LAN AC traffic rule | `settings.lua` (LAN AC tab) |
 | `authentication` | 1 | anonymous | Dashboard API auth | `settings.lua` (Dashboard tab) |
 
-`proxy_provider` and `rule_provider` section types from OpenClash are
-**DEFERRED** post-v1 (see `docs/decision/0001-product-boundary.md`).
+`proxy_provider` from OpenClash is **DEFERRED** post-v1 (see
+`docs/decision/0001-product-boundary.md`). `rule_provider` was previously
+deferred alongside proxy-provider but has been promoted to v1 scope —
+rule-sets are essential for practical rule list authoring.
 
 ---
 
@@ -52,6 +55,7 @@ Quick lookup: which script reads each section at which stage (stages from
 | `groups` | — | — | — | ✓ | — | — | — | — | — | — | — |
 | `dns_servers` | — | — | — | — | — | — | ✓ | — | — | — | — |
 | `config_overwrite` | — | — | — | — | — | ✓ | — | — | — | — | — |
+| `rule_provider` | — | — | — | — | ✓ | — | — | — | — | — | — |
 | `lan_ac_traffic` | — | — | — | — | — | — | — | — | — | ✓ | — |
 | `authentication` | — | — | — | — | — | — | ✓ | ✓ | — | — | — |
 
@@ -529,16 +533,43 @@ dashboard / REST API proxy.
 
 ---
 
+## 9. `rule_provider` (0..N named sections)
+
+One section per rule-set provider. Emitted at Stage 5 into the `rule-providers:`
+block of `config.yaml` by the same script that prepends custom rules. Consumed
+by Clash rules that reference the provider by name (e.g. `RULE-SET,my-geoip,Proxy`).
+
+| Key | Type | Default | Purpose |
+|---|---|---|---|
+| `enabled` | bool | `1` | Emit this provider |
+| `config` | list(string) | `all` | Target config filename(s) or `all` |
+| `name` | string | required | Provider name (referenced from rules) |
+| `type` | enum | `http` | `http` (remote) \| `file` (local upload) |
+| `behavior` | enum | `classical` | `domain` \| `ipcidr` \| `classical` |
+| `format` | enum | `yaml` | `yaml` \| `text` \| `mrs` |
+| `url` | URL | — | Source URL (for `type=http`) |
+| `path` | string | auto | Local cache path under `/etc/clashnivo/rule_provider/` |
+| `interval` | int (seconds) | `86400` | Refresh interval (http only) |
+| `size_limit` | int (bytes) | `0` | Max rule-set size; `0` = unlimited |
+| `proxy` | string | — | Route the fetch through a named proxy/group |
+
+Uploaded rule-set files live at `/etc/clashnivo/rule_provider/<name>.<ext>` and
+are managed through the same CBI page as custom rules (Epic 3c). When
+`type=http`, the file is cached automatically by Mihomo; when `type=file`, the
+user uploads the content via the CBI file-manager widget.
+
+**Dropped vs OpenClash:** none — this is a clean v1 addition.
+
+---
+
 ## Deferred section types
 
 These exist in OpenClash but are **not part of v1** (product-boundary decision):
 
-- `proxy_provider` — external proxy-provider YAML files. Deferred post-v1 as
-  noted in `decision/0001-product-boundary.md`.
-- `rule_provider` — external rule-provider files. Managed through the same
-  upload surface as `proxy_provider`; defer together.
+- `proxy_provider` — external proxy-node YAML files. Deferred post-v1;
+  subscriptions cover the common case.
 
-When these are added (post-v1), update this document before landing code.
+When added (post-v1), update this document before landing code.
 
 ---
 
@@ -653,8 +684,8 @@ or the target file does not exist. No fallback template. Consistent with the
 |---|---|
 | Singleton `clashnivo.config` keys (KEEP) | ~95 |
 | Keys cut vs OpenClash | ~110+ (IPv6, chnroute, streaming, LightGBM, exotic protocols, TUN variants, dev/debug) |
-| Section types (KEEP) | 8 |
-| Section types (DEFERRED) | 2 (`proxy_provider`, `rule_provider`) |
+| Section types (KEEP) | 9 |
+| Section types (DEFERRED) | 1 (`proxy_provider`) |
 | Server protocol types (KEEP) | 5 (ss, vmess, vless, trojan, hysteria2) |
 | Server protocol types (CUT) | 14+ |
 | Group types (KEEP) | 4 (select, url-test, fallback, load-balance) |

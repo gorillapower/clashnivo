@@ -32,6 +32,8 @@ Internal concerns that matter for implementation:
 - Custom proxy group forms: select / url-test / fallback / load-balance types.
 - Config overwrite: a single YAML snippet merged last before binary start.
 - Custom rules: a list of individual Clash rules prepended to the subscription rule set.
+- Rule providers: external rule-set YAML files (geoip / geosite / custom domain lists)
+  referenced from rules by name. Uploaded locally or fetched by URL on a schedule.
 - Proxy mode selection: rule / global / direct.
 - Transparent proxy mode: fake-ip and redir-host (TUN mode deferred to a later epic).
 - DNS configuration: redirect mode (dnsmasq / firewall), upstream DNS servers
@@ -50,9 +52,9 @@ Internal concerns that matter for implementation:
 - LightGBM smart group and associated ML tooling.
 - Developer settings panel.
 - Debug DNS / connection diagnostic tools.
-- Proxy-provider (external provider YAML files) — deferred after custom servers/groups.
+- Proxy-provider (external proxy-node YAML files) — deferred post-v1. Subscriptions
+  cover the common case; proxy-providers are a power-user lift for later.
 - IPv6 proxy (deferred — not in initial scope).
-- Proxy-provider (external provider YAML files) — deferred after custom servers/groups.
 - WireGuard, TUIC, Snell, Mieru, Sudoku, MASQUE, TrustTunnel, and other exotic
   server types — only SS/VMess/VLess/Trojan/Hysteria2 in v1.
 

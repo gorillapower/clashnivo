@@ -117,11 +117,19 @@ value proposition of the app.
 - Fields: name, type, filter regex, exclude-filter regex, test URL, interval, strategy
 - All groups get `include-all-proxies: true` in generated YAML
 
-#### Epic 3c — Custom rules
+#### Epic 3c — Custom rules & rule providers
 
-- `custom-rules.lua` CBI — add/edit/delete individual Clash rules
-- Rules prepended to the subscription rule list at assembly time
-- Basic validation: rule format check before saving
+- `custom-rules.lua` CBI — one page with two stacked sections:
+  1. Rule-provider list (`rule_provider` UCI type; add/edit/delete entries;
+     upload local files or register remote URLs; pick behavior/format)
+  2. Custom rule list (individual Clash rules; may reference a provider
+     via `RULE-SET,<name>,<target>`)
+- Rules prepended to the subscription rule list at assembly time; providers
+  emitted into the `rule-providers:` block alongside
+- Local rule-set files live at `/etc/clashnivo/rule_provider/<name>.<ext>`
+- `yml_rule_provider_set.sh` (fork of OpenClash's equivalent) writes the
+  `rule-providers:` block; `yml_rules_change.sh` handles rule prepend
+- Basic validation: rule format check and provider-name reference check
 
 #### Epic 3d — Config overwrite
 

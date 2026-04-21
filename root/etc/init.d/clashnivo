@@ -1,0 +1,2262 @@
+#!/bin/sh /etc/rc.common
+# Forked from OpenClash (Copyright (c) 2019-2026 vernesong)
+
+START=99
+STOP=15
+USE_PROCD=1
+
+. $IPKG_INSTROOT/usr/share/clashnivo/clashnivo_ps.sh
+. $IPKG_INSTROOT/usr/share/clashnivo/ruby.sh
+. $IPKG_INSTROOT/usr/share/clashnivo/log.sh
+. $IPKG_INSTROOT/usr/share/clashnivo/uci.sh
+. $IPKG_INSTROOT/usr/share/clashnivo/clashnivo_curl.sh
+
+[ -f /etc/openwrt_release ] && {
+FW4=$(command -v fw4)
+DEFAULT_DNSMASQ_CFGID="$(uci -q show "dhcp.@dnsmasq[0]" | awk 'NR==1 {split($0, conf, /[.=]/); print conf[2]}')"
+if [ -f "/tmp/etc/dnsmasq.conf.$DEFAULT_DNSMASQ_CFGID" ]; then
+   DNSMASQ_CONF_DIR="$(awk -F '=' '/^conf-dir=/ {print $2}' "/tmp/etc/dnsmasq.conf.$DEFAULT_DNSMASQ_CFGID")"
+else
+   DNSMASQ_CONF_DIR="/tmp/dnsmasq.d"
+fi
+DNSMASQ_CONF_DIR=${DNSMASQ_CONF_DIR%*/}
+}
+CLASH="/etc/clashnivo/core/mihomo"
+CLASH_CONFIG="/etc/clashnivo"
+CRON_FILE="/etc/crontabs/root"
+CACHE_PATH="/etc/clashnivo/cache.db"
+LOG_FILE="/tmp/clashnivo.log"
+START_LOG="/tmp/clashnivo_start.log"
+PROXY_FWMARK="0x162"
+PROXY_ROUTE_TABLE="0x162"
+QUICK_START_CHECK=false
+QUICK_START=true
+
+add_cron()
+{
+   [ "$(tail -n1 /etc/crontabs/root | wc -l)" -eq 0 ] && [ -n "$(cat /etc/crontabs/root 2>/dev/null)" ] && echo >> /etc/crontabs/root
+   [ -z "$(grep "clashnivo.sh" "$CRON_FILE" 2>/dev/null)" ] && {
+      [ "$(uci_get_config "auto_update")" -eq 1 ] && [ "$(uci_get_config "config_auto_update_mode")" -ne 1 ] && echo "0 $(uci_get_config "auto_update_time" || 1) * * $(uci_get_config "config_update_week_time" || 0) /usr/share/clashnivo/clashnivo.sh #clashnivo-cron-task" >> $CRON_FILE
+   }
+   [ -z "$(grep "clashnivo_ipdb.sh" "$CRON_FILE" 2>/dev/null)" ] && {
+      [ "$(uci_get_config "geo_auto_update")" -eq 1 ] && echo "0 $(uci_get_config "geo_update_day_time" || 1) * * $(uci_get_config "geo_update_week_time" || 0) /usr/share/clashnivo/clashnivo_ipdb.sh #clashnivo-cron-task" >> $CRON_FILE
+   }
+   [ -z "$(grep "clashnivo_geosite.sh" "$CRON_FILE" 2>/dev/null)" ] && {
+      [ "$(uci_get_config "geosite_auto_update")" -eq 1 ] && echo "0 $(uci_get_config "geosite_update_day_time" || 1) * * $(uci_get_config "geosite_update_week_time" || 0) /usr/share/clashnivo/clashnivo_geosite.sh #clashnivo-cron-task" >> $CRON_FILE
+   }
+   [ -z "$(grep "clashnivo_geoip.sh" "$CRON_FILE" 2>/dev/null)" ] && {
+      [ "$(uci_get_config "geoip_auto_update")" -eq 1 ] && echo "0 $(uci_get_config "geoip_update_day_time" || 1) * * $(uci_get_config "geoip_update_week_time" || 0) /usr/share/clashnivo/clashnivo_geoip.sh #clashnivo-cron-task" >> $CRON_FILE
+   }
+   [ -z "$(grep "clashnivo_geoasn.sh" "$CRON_FILE" 2>/dev/null)" ] && {
+      [ "$(uci_get_config "geoasn_auto_update")" -eq 1 ] && echo "0 $(uci_get_config "geoasn_update_day_time" || 1) * * $(uci_get_config "geoasn_update_week_time" || 0) /usr/share/clashnivo/clashnivo_geoasn.sh #clashnivo-cron-task" >> $CRON_FILE
+   }
+   [ -z "$(grep "/etc/init.d/clashnivo" "$CRON_FILE" 2>/dev/null)" ] && {
+      [ "$(uci_get_config "auto_restart")" -eq 1 ] && echo "0 $(uci_get_config "auto_restart_day_time" || 1) * * $(uci_get_config "auto_restart_week_time" || 0) /etc/init.d/clashnivo restart #clashnivo-cron-task" >> $CRON_FILE
+   }
+
+   config_load "clashnivo"
+   config_foreach add_overwrite_cron "config_overwrite"
+
+   crontab $CRON_FILE
+   start_watchdog
+}
+
+del_cron()
+{
+   sed -i '/#clashnivo-cron-task/d' $CRON_FILE
+   sed -i '/#clashnivo-overwrite-download/d' $CRON_FILE
+   /etc/init.d/cron restart
+} >/dev/null 2>&1
+
+save_dnsmasq_server() {
+   if [ -z "$1" ] || [ "$1" == "127.0.0.1#${dns_port}" ]; then
+     return
+   fi
+
+   # Coexistence guard: if another proxy (OpenClash, etc.) crashed without
+   # reverting dnsmasq, the snapshot would capture its 127.0.0.1#<port>
+   # entry as "original" — restoring that on stop leaves a dead pointer.
+   if echo "$1" | grep -q "^127\.0\.0\.1#"; then
+      LOG_WARN "Dnsmasq snapshot: discarding proxy-pointer server【$1】— likely stale state from a crashed proxy"
+      return
+   fi
+
+   uci -q add_list clashnivo.config.dnsmasq_server="$1"
+}
+
+set_dnsmasq_server() {
+   if [ -z "$1" ] || [ "$1" == "127.0.0.1#${dns_port}" ]; then
+     return
+   fi
+
+   uci -q add_list dhcp.@dnsmasq[0].server="$1"
+}
+
+change_dns() {
+   if ! /etc/init.d/dnsmasq enabled; then
+      return
+   fi
+
+   /usr/share/clashnivo/clashnivo_custom_domain_dns.sh
+
+   if [ "$1" -eq 1 ]; then
+      uci -q del clashnivo.config.dnsmasq_server
+      config_load "dhcp"
+      config_list_foreach "$(uci -q show dhcp.@dnsmasq[0].server |awk -F '.' '{print $2}')" "server" save_dnsmasq_server
+      uci -q del dhcp.@dnsmasq[-1].server
+      uci -q add_list dhcp.@dnsmasq[0].server=127.0.0.1#"$dns_port"
+      uci -q set clashnivo.config.dnsmasq_noresolv="$(uci -q get dhcp.@dnsmasq[0].noresolv)"
+      uci -q set clashnivo.config.dnsmasq_resolvfile="$(uci -q get dhcp.@dnsmasq[0].resolvfile)"
+      uci -q delete dhcp.@dnsmasq[0].resolvfile
+      uci -q set dhcp.@dnsmasq[0].noresolv=1
+      uci -q set dhcp.@dnsmasq[0].localuse=1
+      uci -q set clashnivo.config.redirect_dns=1
+      uci -q set clashnivo.config.dnsmasq_cachesize="$(uci -q get dhcp.@dnsmasq[0].cachesize)"
+      uci -q set dhcp.@dnsmasq[0].cachesize=0
+      uci -q set clashnivo.config.cachesize_dns=1
+   else
+      uci -q set clashnivo.config.redirect_dns=0
+      uci -q set clashnivo.config.cachesize_dns=0
+   fi
+
+   uci -q commit dhcp
+   uci -q commit clashnivo
+   /etc/init.d/dnsmasq restart
+} >/dev/null 2>&1
+
+revert_dns() {
+   if ! /etc/init.d/dnsmasq enabled; then
+      return
+   fi
+
+   rm -rf ${DNSMASQ_CONF_DIR}/dnsmasq_clashnivo_custom_domain.conf
+
+   [ "$1" -eq 1 ] && {
+      uci -q del dhcp.@dnsmasq[-1].server
+      [ -n "${10}" ] && {
+         config_load "clashnivo"
+         config_list_foreach "config" "dnsmasq_server" set_dnsmasq_server
+      }
+
+      if [ "$4" == "0" ] || [ -z "$4" ] || [ -z "$(uci -q show dhcp.@dnsmasq[0].server)" ]; then
+         uci -q set dhcp.@dnsmasq[0].noresolv=0
+         if [ -n "$5" ] && [ -n "$(grep nameserver $5)" ]; then
+            uci -q set dhcp.@dnsmasq[0].resolvfile="$5"
+         elif [ -n "$3" ] && [ -n "$(grep nameserver $3)" ]; then
+            uci -q set dhcp.@dnsmasq[0].resolvfile="$3"
+         elif [ -s "/tmp/resolv.conf.d/resolv.conf.auto" ] && [ -n "$(grep "nameserver" /tmp/resolv.conf.d/resolv.conf.auto)" ]; then
+            uci -q set dhcp.@dnsmasq[0].resolvfile=/tmp/resolv.conf.d/resolv.conf.auto
+            uci -q set clashnivo.config.default_resolvfile=/tmp/resolv.conf.d/resolv.conf.auto
+         elif [ -s "/tmp/resolv.conf.auto" ] && [ -n "$(grep "nameserver" /tmp/resolv.conf.auto)" ]; then
+            uci -q set dhcp.@dnsmasq[0].resolvfile=/tmp/resolv.conf.auto
+            uci -q set clashnivo.config.default_resolvfile=/tmp/resolv.conf.auto
+         else
+            uci -q set dhcp.@dnsmasq[0].resolvfile=/tmp/resolv.conf.d/resolv.conf.auto
+            uci -q set clashnivo.config.default_resolvfile=/tmp/resolv.conf.d/resolv.conf.auto
+         fi
+         uci -q set dhcp.@dnsmasq[0].localuse=1
+      fi
+   }
+
+   [ "$6" -eq 1 ] && {
+      uci -q set dhcp.@dnsmasq[0].cachesize="$7"
+      uci -q set clashnivo.config.cachesize_dns=0
+      uci -q delete clashnivo.config.dnsmasq_cachesize
+   }
+
+   [ "$1" -eq 1 ] && {
+      uci -q set clashnivo.config.redirect_dns=0
+      uci -q del clashnivo.config.dnsmasq_server
+   }
+
+   uci -q commit dhcp
+   uci -q commit clashnivo
+
+   /etc/init.d/dnsmasq restart
+
+   masq_port=$(uci -q get dhcp.@dnsmasq[0].port)
+   if [ "$(nslookup www.apple.com 127.0.0.1:${masq_port} >/dev/null 2>&1 || echo $?)" = "1" ]; then
+      resolv_file=$(uci -q get dhcp.@dnsmasq[0].resolvfile)
+      wan_dns=$(/usr/share/clashnivo/clashnivo_get_network.lua "dns")
+      mkdir -p "$(dirname "$resolv_file")"
+      touch "$resolv_file"
+
+      if [ -n "$wan_dns" ]; then
+         echo "# Interface lan" > "$resolv_file"
+         for dns in $wan_dns; do
+            echo "nameserver $dns" >> "$resolv_file"
+         done
+      else
+         cat > "$resolv_file" <<-EOF
+# Interface lan
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+EOF
+      fi
+      /etc/init.d/dnsmasq restart
+   fi
+
+} >/dev/null 2>&1
+
+start_fail()
+{
+   uci -q set clashnivo.config.enable=0
+   uci -q commit clashnivo
+   stop
+   exit 0
+}
+
+sub_info_set()
+{
+   local section="$1" name
+   config_get "name" "$section" "name" ""
+
+   if [ -z "$name" ]; then
+      return
+   fi
+
+   if [ "$name" == "$2" ] && [ -n "$3" ]; then
+      if [ "$sub_info_setted" != "1" ]; then
+         uci -q delete clashnivo.$section.url
+      fi
+      uci -q add_list clashnivo.$section.url="$3"
+      uci -q commit clashnivo
+      sub_info_setted=1
+   fi
+}
+
+sub_info_get()
+{
+   local section="$1" address enabled name
+   config_get_bool "enabled" "$section" "enabled" "1"
+   config_get "address" "$section" "address" ""
+   config_get "name" "$section" "name" ""
+
+   if [ "$subscribe_enable" = "1" ]; then
+      return
+   fi
+
+   if [ "$enabled" -eq 0 ]; then
+      return
+   fi
+
+   if [ -z "$address" ]; then
+      return
+   fi
+
+   if [ -z "$name" ]; then
+      SUB_CONFIG_FILE="/etc/clashnivo/config/config.yaml"
+   else
+      SUB_CONFIG_FILE="/etc/clashnivo/config/$name.yaml"
+   fi
+
+   if [ "$SUB_CONFIG_FILE" != "$2" ]; then
+      return
+   fi
+
+   subscribe_enable=1
+}
+
+config_choose()
+{
+if [ ! -f "$RAW_CONFIG_FILE" ]; then
+   config_load "clashnivo"
+   config_foreach sub_info_get "config_subscribe" "$RAW_CONFIG_FILE"
+   if [ "$subscribe_enable" = "1" ]; then
+      LOG_OUT "【$RAW_CONFIG_FILE】Config File Does Not Exist, You Have Set Subscription Information, Ready To Download..."
+      /usr/share/clashnivo/clashnivo.sh "$RAW_CONFIG_FILE" &
+      exit 0
+   fi
+fi
+
+if [ -z "$RAW_CONFIG_FILE" ] || [ ! -f "$RAW_CONFIG_FILE" ]; then
+   for file_name in /etc/clashnivo/config/*
+   do
+      if [ -f "$file_name" ]; then
+         CONFIG_NAME=$(echo "$file_name" |awk -F '/' '{print $5}' 2>/dev/null)
+         uci -q set clashnivo.config.config_path="/etc/clashnivo/config/$CONFIG_NAME"
+         uci -q commit clashnivo
+         RAW_CONFIG_FILE="/etc/clashnivo/config/$CONFIG_NAME"
+         CONFIG_FILE="/etc/clashnivo/$CONFIG_NAME"
+         TMP_CONFIG_FILE="/tmp/yaml_config_tmp_$CONFIG_NAME"
+         LOG_ERROR "Config Not Found, Switch Config File to【$RAW_CONFIG_FILE】"
+         break
+      fi
+   done
+fi
+
+if [ ! -f "$RAW_CONFIG_FILE" ]; then
+   LOG_ERROR "Config Not Found"
+   exit 0
+fi
+
+CONFIG_NAME=$(echo "$RAW_CONFIG_FILE" |awk -F '/' '{print $5}' 2>/dev/null)
+HISTORY_PATH="/etc/clashnivo/history/${CONFIG_NAME%.*}.db"
+} >/dev/null 2>&1
+
+config_check()
+{
+cp "$RAW_CONFIG_FILE" "$TMP_CONFIG_FILE"
+
+ruby -ryaml -rYAML -I "/usr/share/clashnivo" -E UTF-8 -e "
+begin
+   YAML.load_file('$RAW_CONFIG_FILE');
+rescue Exception => e
+   YAML.LOG_ERROR('Unable To Parse Config File,【' + e.message + '】');
+   system 'rm -rf ${TMP_CONFIG_FILE}';
+end
+" 2>/dev/null >> $LOG_FILE
+if [ $? -ne 0 ]; then
+   LOG_ERROR "Ruby Works Abnormally, Please Check The Ruby Library Depends!"
+   start_fail
+elif [ ! -f "$TMP_CONFIG_FILE" ] || [ ! -s "$TMP_CONFIG_FILE" ]; then
+   LOG_ERROR "Config File Format Validation Failed..."
+   start_fail
+fi
+}
+
+check_run_quick()
+{
+   if $QUICK_START_CHECK; then
+      return
+   fi
+
+   QUICK_START_CHECK=true
+
+   cat "/tmp/clashnivo.change" | while read -r i; do
+      file_path=$(echo "$i" |awk -F ' #edited time# ' '{print $1}')
+      if [ -z "$(grep "$file_path #edited time# $(date -r "$file_path")$" "/tmp/clashnivo.change")" ]; then
+         LOG_TIP "Because of the file【 $file_path 】modificated, Pause quick start..."
+         rm -rf /tmp/clashnivo.change
+         break
+      fi
+   done
+
+   if [ ! -f "/tmp/clashnivo.change" ]; then
+      QUICK_START=false
+   fi
+} >/dev/null 2>&1
+
+write_run_quick()
+{
+   : > "/tmp/clashnivo.change"
+   {
+      echo "/etc/config/clashnivo"
+      echo "$RAW_CONFIG_FILE"
+      echo "$CONFIG_FILE"
+      ls -d /etc/clashnivo/custom/* 2>/dev/null
+      ls -d /etc/clashnivo/overwrite/* 2>/dev/null
+   } | while read -r file; do
+      echo "$file #edited time# $(date -r "$file")" >> "/tmp/clashnivo.change"
+   done
+} >/dev/null 2>&1
+
+do_run_mode()
+{
+   en_mode=$(uci_get_config "operation_mode")
+
+   if [ "$en_mode" != "fake-ip" ] && [ "$en_mode" != "redir-host" ]; then
+      en_mode="fake-ip"
+   fi
+}
+
+do_run_file()
+{
+   source "/etc/openwrt_release"
+   [ "$small_flash_memory" == "1" ] || [ -n "$(echo $core_version |grep mips)" ] || [ -n "$(echo $DISTRIB_ARCH |grep mips)" ] || [ -n "$(opkg status libc 2>/dev/null |grep 'Architecture' |awk -F ': ' '{print $2}' |grep mips)" ] || [ -n "$(apk list libc 2>/dev/null |grep mips)" ] && mkdir -p /tmp/etc/clashnivo && CACHE_PATH="/tmp/etc/clashnivo/cache.db"
+
+   [ -f "/etc/clashnivo/geosite.dat" ] && {
+      mv "/etc/clashnivo/geosite.dat" "/etc/clashnivo/GeoSite.dat"
+   }
+
+   [ -f "/etc/clashnivo/geoip.dat" ] && {
+      mv "/etc/clashnivo/geoip.dat" "/etc/clashnivo/GeoIP.dat"
+   }
+
+   if [ "$small_flash_memory" != "1" ]; then
+      meta_core_path="/etc/clashnivo/core/mihomo"
+      ipdb_path="/etc/clashnivo/Country.mmdb"
+      geosite_path="/etc/clashnivo/GeoSite.dat"
+      geoip_path="/etc/clashnivo/GeoIP.dat"
+      mv "/tmp/etc/clashnivo/Country.mmdb" "$ipdb_path" 2>/dev/null
+      mv "/tmp/etc/clashnivo/GeoSite.dat" "$geosite_path" 2>/dev/null
+      mv "/tmp/etc/clashnivo/GeoIP.dat" "$geoip_path" 2>/dev/null
+      [ -d "/tmp/etc/clashnivo/core/" ] && mv "/tmp/etc/clashnivo/core/" "/etc/clashnivo" 2>/dev/null
+      if [ "$CACHE_PATH" != "/tmp/etc/clashnivo/cache.db" ]; then
+         rm -rf "/tmp/etc/clashnivo"
+      fi
+   else
+      meta_core_path="/tmp/etc/clashnivo/core/mihomo"
+      ipdb_path="/tmp/etc/clashnivo/Country.mmdb"
+      geosite_path="/tmp/etc/clashnivo/GeoSite.dat"
+      geoip_path="/tmp/etc/clashnivo/GeoIP.dat"
+      [ ! -h "/etc/clashnivo/Country.mmdb" ] && mv "/etc/clashnivo/Country.mmdb" "$ipdb_path" 2>/dev/null
+      [ ! -h "/etc/clashnivo/GeoSite.dat" ] && mv "/etc/clashnivo/GeoSite.dat" "$geosite_path" 2>/dev/null
+      [ ! -h "/etc/clashnivo/GeoIP.dat" ] && mv "/etc/clashnivo/GeoIP.dat" "$geoip_path" 2>/dev/null
+      [ -d "/etc/clashnivo/core/" ] && mv "/etc/clashnivo/core/" "/tmp/etc/clashnivo" 2>/dev/null
+   fi
+
+   rm -rf "/etc/clashnivo/cache.db"
+
+   # In clashnivo, $CLASH points directly at the mihomo binary — no symlink needed.
+   if [ "$small_flash_memory" = "1" ]; then
+      CLASH="$meta_core_path"
+   fi
+
+   if [ -f "$CLASH" ] && [ ! -x "$CLASH" ]; then
+      chmod 4755 "$CLASH"
+      chown root:root "$CLASH"
+   fi
+
+   [ ! -f "$CLASH" ] && {
+      LOG_TIP "Detected that the Core is not Installed, Ready to Download..."
+      rm -rf "/tmp/mihomo_last_version"
+      /usr/share/clashnivo/clashnivo_core.sh "Meta"
+      if [ ! -f "$CLASH" ]; then
+         start_fail
+      fi
+   }
+
+   [ -f "$CLASH" ] && [ ! -x "$CLASH" ] && chmod 4755 "$CLASH"
+
+   [ -f "$ipdb_path" ] && [ "$small_flash_memory" = "1" ] && {
+      ln -s "$ipdb_path" /etc/clashnivo/Country.mmdb
+   }
+
+   [ -f "$geosite_path" ] && [ "$small_flash_memory" = "1" ] && {
+      ln -s "$geosite_path" /etc/clashnivo/GeoSite.dat
+   }
+
+   [ -f "$geoip_path" ] && [ "$small_flash_memory" = "1" ] && {
+      ln -s "$geoip_path" /etc/clashnivo/GeoIP.dat
+   }
+
+   if [ -f "$HISTORY_PATH" ]; then
+      cmp -s "$CACHE_PATH" "$HISTORY_PATH"
+      if [ "$?" -ne "0" ]; then
+         if [ "$CACHE_PATH" != "/tmp/etc/clashnivo/cache.db" ]; then
+            ln -s "$HISTORY_PATH" "$CACHE_PATH"
+         else
+            cp "$HISTORY_PATH" "$CACHE_PATH"
+         fi
+      fi
+   fi
+
+   if [ "$CACHE_PATH" == "/tmp/etc/clashnivo/cache.db" ]; then
+      [ ! -f "$CACHE_PATH" ] && touch "$CACHE_PATH"
+      ln -s "$CACHE_PATH" /etc/clashnivo/cache.db
+   else
+      [ ! -f "$CACHE_PATH" ] && touch "$HISTORY_PATH"
+      ln -s "$HISTORY_PATH" "$CACHE_PATH"
+   fi
+
+} >/dev/null 2>&1
+
+container() {
+   [ -f "/proc/1/cgroup" ] && grep -qiE "(docker|containerd|lxc|podman|kubepods|container)" /proc/1/cgroup 2>/dev/null && return 0
+   [ -f "/proc/1/environ" ] && grep -qiE "(docker|containerd|lxc|podman|kubepods|container)" /proc/1/environ 2>/dev/null && return 0
+   [ -f "/.dockerenv" ] && return 0
+   env | grep -qiE "(docker|kubernetes|container)" && return 0
+   return 1
+}
+
+check_mod()
+{
+   if container; then
+      return 0
+   fi
+
+   module_upper=$(echo "$1" | tr a-z A-Z)
+   if [ -f /proc/config.gz ] && zcat /proc/config.gz | grep -q "CONFIG_${module_upper}=y"; then
+      return 0
+   fi
+
+   if lsmod | grep -q "^$1 "; then
+      return 0
+   fi
+
+   modprobe $1 2>/dev/null
+   if [ $? -eq 0 ]; then
+      return 0
+   fi
+
+   LOG_ERROR "【$1】module not found, please check your system depends if something abnormal!"
+} >/dev/null 2>&1
+
+check_core_status()
+{
+   CORE_WAIT=0
+   CORE_HTTP_CODE=0
+
+   while ( [ -z "$(pidof mihomo)" ] && [ "$CORE_WAIT" -le 10 ] )
+   do
+      sleep 1
+      let CORE_WAIT++
+   done
+
+   reg4='^(([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])\.){3}([0-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])$'
+   READY_WAIT=0
+   while ( [ -n "$(pidof mihomo)" ] && [ "$CORE_HTTP_CODE" != "200" ] && [ "$READY_WAIT" -le 300 ] && [ -n "$(echo ${lan_ip} | grep -Eo ${reg4})" ] )
+   do
+      CORE_HTTP_CODE=$(curl -m 5 -o /dev/null -s -w '%{http_code}' -H 'Content-Type: application/json' -H "Authorization: Bearer ${da_password}" -XGET http://${lan_ip}:${cn_port}/group)
+      let READY_WAIT++
+      sleep 1
+   done
+   if [ -z "$(echo ${lan_ip} | grep -Eo ${reg4})" ]; then
+      LOG_ERROR "LAN IP Address Get Error, Please Check The LAN Interface Setting or Choose the Correct Interface in the Setting!"
+      start_fail
+   fi
+   if [ -n "$(pidof mihomo)" ] && [ "$CORE_HTTP_CODE" != "200" ]; then
+      LOG_ERROR "Core Initial Configuration Timeout, Please Check The Log Infos!"
+      start_fail
+   fi
+   if [ -z "$(pidof mihomo)" ]; then
+      LOG_ERROR "Core Start Failed, Please Check The Log Infos!"
+      start_fail
+   fi
+
+   if [ "$1" == "start" ]; then
+      change_dns "$enable_redirect_dns"
+      set_firewall
+      LOG_TIP "Clash Nivo Start Successful!"
+   else
+      set_firewall
+      LOG_TIP "Firewall Reload Successful!"
+   fi
+
+   write_run_quick
+   SLOG_CLEAN
+} >/dev/null 2>&1
+
+start_run_core()
+{
+   ulimit -SHn 1000000
+   ulimit -v unlimited
+   ulimit -u unlimited
+
+   if ! $QUICK_START; then
+      mv "$TMP_CONFIG_FILE" "$CONFIG_FILE"
+      rm -rf "$TMP_CONFIG_FILE"
+   fi
+   chown root:root "$CLASH"
+   procd_open_instance "clashnivo"
+   procd_set_param env SAFE_PATHS=/usr/share/clashnivo:/etc/ssl
+   procd_set_param command /bin/sh -c "$CLASH -d $CLASH_CONFIG -f \"$CONFIG_FILE\" >> $LOG_FILE 2>&1"
+   procd_set_param user "root"
+   procd_set_param group "nogroup"
+   procd_set_param limits nproc="unlimited" as="unlimited" memlock="unlimited" nofile="1000000 1000000"
+   procd_set_param respawn 300 5 3
+   procd_set_param stderr 1
+   procd_set_param no_new_privs 1
+   procd_close_instance
+} >/dev/null 2>&1
+
+nft_ac_add()
+{
+   if [ -z "$1" ]; then
+      return
+   fi
+
+   nft add element inet fw4 "$2" { "$1" }
+} >/dev/null 2>&1
+
+ac_add()
+{
+   if [ -z "$1" ]; then
+      return
+   fi
+
+   ipset add "$2" "$1"
+} >/dev/null 2>&1
+
+wan_name_add()
+{
+   if [ -z "$1" ]; then
+      return
+   fi
+
+   if [ -n "$wan_ints" ]; then
+      wan_ints="$wan_ints $1"
+   else
+      wan_ints="$1"
+   fi
+}
+
+upnp_exclude()
+{
+   if [ -s "$upnp_lease_file" ]; then
+      cat "$upnp_lease_file" |while read -r line
+      do
+         if [ -n "$line" ]; then
+            upnp_ip=$(echo "$line" |awk -F ':' '{print $3}')
+            upnp_dp=$(echo "$line" |awk -F ':' '{print $4}')
+            upnp_type=$(echo "$line" |awk -F ':' '{print $1}' |tr '[A-Z]' '[a-z]')
+            if [ -n "$upnp_ip" ] && [ -n "$upnp_dp" ] && [ -n "$upnp_type" ]; then
+               if [ -n "$FW4" ]; then
+                  if [ -z "$(nft list chain inet fw4 clashnivo_upnp |grep "$upnp_ip" |grep "$upnp_dp" |grep "$upnp_type")" ]; then
+                     nft add rule inet fw4 clashnivo_upnp ip saddr { "$upnp_ip" } "$upnp_type" sport "$upnp_dp" counter return
+                  fi
+               else
+                  if [ -z "$(iptables -t mangle -nL clashnivo_upnp |grep "$upnp_ip" |grep "$upnp_dp" |grep "$upnp_type")" ]; then
+                     iptables -t mangle -A clashnivo_upnp -p "$upnp_type" -s "$upnp_ip" --sport "$upnp_dp" -j RETURN
+                  fi
+               fi
+            fi
+         fi
+      done
+   fi
+} >/dev/null 2>&1
+
+firewall_lan_ac_traffic()
+{
+   local src_port sport_rule dscp_rule sport_ipt dscp_ipt src_ip proto target target_ enabled family dscp rule output_rule comment
+   config_get "src_port" "$section" "src_port" "0-65535"
+   config_get "src_ip" "$section" "src_ip" ""
+   config_get "proto" "$section" "proto" "both"
+   config_get "target" "$section" "target" "return"
+   config_get_bool "enabled" "$section" "enabled" "0"
+   config_get "family" "$section" "family" "both"
+   config_get "dscp" "$section" "dscp" ""
+   config_get "interface" "$section" "interface" ""
+   config_get "user" "$section" "user" ""
+   config_get "comment" "$section" "comment" "lan_ac_traffic"
+
+   if [ "${enabled}" == "0" ]; then
+      return
+   fi
+
+   # ipv4 only; skip rules that are explicitly ipv6-only
+   if [ "${family}" == "ipv6" ]; then
+      return
+   fi
+
+   local e_udp=false
+   local e_tcp=false
+   if [ "${proto}" == "tcp" ]; then e_tcp=true; fi
+   if [ "${proto}" == "udp" ]; then e_udp=true; fi
+   if [ "${proto}" == "both" ]; then e_tcp=true; e_udp=true; fi
+
+   if [ -n "$FW4" ]; then
+      if [ "${src_ip}" == "localnetwork" ]; then
+         src_ip="ip saddr @localnetwork"
+      else
+         if [ -n "${src_ip}" ]; then
+            src_ip="ip saddr { ${src_ip} }"
+         fi
+      fi
+
+      if [ -n "${src_port}" ]; then
+         sport_rule="sport ${src_port}"
+      fi
+
+      if [ -n "${interface}" ]; then
+         interface_rule="iifname \"${interface}\""
+      fi
+
+      if [ -n "${user}" ]; then
+         user_rule="meta skuid ${user}"
+      fi
+
+      if [ -n "${dscp}" ]; then
+         dscp_rule="ip dscp ${dscp}"
+      fi
+
+      if [ "${target}" == "drop" ]; then
+         target_="return"
+      else
+         target_="${target}"
+      fi
+
+      rule_target_v4_="${sport_rule} ${interface_rule} ${dscp_rule} meta nfproto {ipv4} ip daddr != { ${fakeip_range} } ${src_ip} counter ${target_} comment ${comment}"
+      output_rule_target_v4_="${sport_rule} ${user_rule} ${interface_rule} ${dscp_rule} ip daddr != { ${fakeip_range} } ${src_ip} counter ${target_} comment ${comment}"
+      rule_target_v4="${sport_rule} ${interface_rule} ${dscp_rule} meta nfproto {ipv4} ip daddr != { ${fakeip_range} } ${src_ip} counter ${target} comment ${comment}"
+      output_rule_target_v4="${sport_rule} ${user_rule} ${interface_rule} ${dscp_rule} ip daddr != { ${fakeip_range} } ${src_ip} counter ${target} comment ${comment}"
+
+      if $e_tcp ; then
+         nft insert rule inet fw4 clashnivo_output position 0 tcp ${output_rule_target_v4_}
+         [ -z "${user_rule}" ] && nft insert rule inet fw4 clashnivo position 0 tcp ${rule_target_v4_}
+      fi
+      if $e_udp ; then
+         nft insert rule inet fw4 clashnivo_mangle_output position 0 udp ${output_rule_target_v4}
+         [ -z "${user_rule}" ] && nft insert rule inet fw4 clashnivo_mangle position 0 udp ${rule_target_v4}
+      fi
+      if $e_tcp ; then
+         nft insert rule inet fw4 clashnivo_post position 0 tcp ${output_rule_target_v4_}
+      fi
+      if $e_udp ; then
+         nft insert rule inet fw4 clashnivo_post position 0 udp ${output_rule_target_v4_}
+      fi
+   else
+      if [ "${src_ip}" == "localnetwork" ]; then
+         src_ip="-m set --match-set localnetwork src"
+      else
+         if [ -n "${src_ip}" ]; then
+            src_ip="-s ${src_ip}"
+         fi
+      fi
+
+      src_port=$(echo ${src_port} | sed "s/-/:/g" 2>/dev/null)
+      if [ -n "${src_port}" ]; then
+         sport_ipt="--sport ${src_port}"
+      fi
+
+      if [ "${target}" == "accept" ]; then target="ACCEPT" target_="ACCEPT"; fi
+      if [ "${target}" == "return" ]; then target="RETURN" target_="RETURN"; fi
+      if [ "${target}" == "drop" ]; then target="DROP" target_="RETURN"; fi
+
+      if [ -n "${interface}" ]; then
+         interface_rule="-i ${interface}"
+      fi
+
+      if [ -n "${user}" ]; then
+         user_rule="-m owner --uid-owner ${user}"
+      fi
+
+      if [ -n "${dscp}" ]; then
+         if iptables -m dscp --help >/dev/null 2>&1; then
+            dscp_ipt="-m dscp --dscp ${dscp}"
+         else
+            LOG_WARN "iptables DSCP module not available, please try DCSP rule by core instead, skipping DSCP rule for【${comment}】"
+         fi
+      fi
+
+      rule_target_v4_="! -d ${fakeip_range} ${src_ip} ${sport_ipt} ${interface_rule} ${dscp_ipt} -j ${target_} -m comment --comment ${comment}"
+      output_rule_target_v4_="! -d ${fakeip_range} ${src_ip} ${sport_ipt} ${user_rule} ${interface_rule} ${dscp_ipt} -j ${target_} -m comment --comment ${comment}"
+      rule_target_v4="! -d ${fakeip_range} ${src_ip} ${sport_ipt} ${interface_rule} ${dscp_ipt} -j ${target} -m comment --comment ${comment}"
+      output_rule_target_v4="! -d ${fakeip_range} ${src_ip} ${sport_ipt} ${user_rule} ${interface_rule} ${dscp_ipt} -j ${target} -m comment --comment ${comment}"
+
+      if $e_tcp ; then
+         iptables -t nat -I clashnivo_output -p tcp ${output_rule_target_v4_}
+         [ -z "${user_rule}" ] && iptables -t nat -I clashnivo -p tcp ${rule_target_v4_}
+      fi
+      if $e_udp ; then
+         iptables -t mangle -I clashnivo_output -p udp ${output_rule_target_v4}
+         [ -z "${user_rule}" ] && iptables -t mangle -I clashnivo -p udp ${rule_target_v4}
+      fi
+      if $e_tcp ; then
+         iptables -t nat -I clashnivo_post -p tcp ${output_rule_target_v4_}
+      fi
+      if $e_udp ; then
+         iptables -t nat -I clashnivo_post -p udp ${output_rule_target_v4_}
+      fi
+   fi
+}
+
+firewall_rule_exclude()
+{
+   local section="$1"
+   local name src dest dest_port dest_ip proto target enabled family
+
+   config_get "name" "$section" "name" ""
+   config_get "src" "$section" "src" ""
+   config_get "dest" "$section" "dest" ""
+   config_get "dest_port" "$section" "dest_port" ""
+   config_get "dest_ip" "$section" "dest_ip" ""
+   config_get "proto" "$section" "proto" ""
+   config_get "target" "$section" "target" ""
+   config_get "enabled" "$section" "enabled" ""
+   config_get "family" "$section" "family" ""
+
+   if [ a"$target" != aACCEPT  ] || [ a"$enabled" == a0 ]; then
+      return
+   fi
+
+   if [ "$family" == "ipv6" ]; then
+      return
+   fi
+
+   local e_udp=false
+   local e_tcp=false
+   for p in $proto; do
+       if [ $p == tcp ]; then e_tcp=true; fi
+       if [ $p == udp ]; then e_udp=true; fi
+       if [ $p == all ]; then e_tcp=true; e_udp=true; fi
+   done
+
+   if [ -z "$proto" ]; then e_tcp=true; e_udp=true; fi
+
+   if ! $e_udp && ! $e_tcp ; then
+       return
+   fi
+
+   if [ -n "$(echo $dest_port |grep -E '\-|\:' 2>/dev/null)" ]; then
+      LOG_WARN "Because there is a port range【$dest_port】in the firewall rule settings【$name】auto bypassing may cause the normal connection of the client not to reach the core, if necessary, please add your own in the access control!"
+      return
+   fi
+
+   if [ -n "$FW4" ]; then
+      dest_ip=$(echo $dest_ip |sed "s/ /,/g" 2>/dev/null)
+
+      for i in $dest_port; do
+         if $e_tcp ; then
+            nft insert rule inet fw4 clashnivo_output position 0 meta nfproto {ipv4} tcp sport "$i" counter return
+            if [ -z "$dest_ip" ]; then
+               nft insert rule inet fw4 clashnivo position 0 meta nfproto {ipv4} tcp sport "$i" counter return
+            else
+               nft insert rule inet fw4 clashnivo position 0 ip saddr { "$dest_ip" } tcp sport "$i" counter return
+            fi
+         fi
+         if $e_udp ; then
+            nft insert rule inet fw4 clashnivo_mangle_output position 0 meta nfproto {ipv4} udp sport "$i" counter return
+            if [ -z "$dest_ip" ]; then
+               nft insert rule inet fw4 clashnivo_mangle position 0 meta nfproto {ipv4} udp sport "$i" counter return
+            else
+               nft insert rule inet fw4 clashnivo_mangle position 0 ip saddr { "$dest_ip" } udp sport "$i" counter return
+            fi
+         fi
+      done
+   else
+      dest_port=$(echo $dest_port |sed "s/-/:/g" 2>/dev/null)
+      dest_ip=$(echo $dest_ip |sed "s/ /,/g" 2>/dev/null)
+
+      for i in $dest_port; do
+         if $e_tcp ; then
+            iptables -t nat -I clashnivo_output -p tcp --sport "$i" -j RETURN
+            if [ -z "$dest_ip" ]; then
+               iptables -t nat -I clashnivo -p tcp --sport "$i" -j RETURN
+            else
+               iptables -t nat -I clashnivo -p tcp -s "$dest_ip" --sport "$i" -j RETURN
+            fi
+         fi
+         if $e_udp ; then
+            iptables -t mangle -I clashnivo_output -p udp --sport "$i" -j RETURN
+            if [ -z "$dest_ip" ]; then
+               iptables -t mangle -I clashnivo -p udp --sport "$i" -j RETURN
+            else
+               iptables -t mangle -I clashnivo -p udp -s "$dest_ip" --sport "$i" -j RETURN
+            fi
+         fi
+      done
+   fi
+} >/dev/null 2>&1
+
+firewall_redirect_exclude()
+{
+   local section="$1"
+   local name src_dport dest_port dest_ip proto enabled
+   config_get "name" "$section" "name" ""
+   config_get "src_dport" "$section" "src_dport" ""
+   config_get "dest_port" "$section" "dest_port" ""
+   config_get "dest_ip" "$section" "dest_ip" ""
+   config_get "proto" "$section" "proto" ""
+   config_get "enabled" "$section" "enabled" ""
+
+   if [ -z "$src_dport" ] || [ a"$enabled" == a0 ]; then
+      return
+   fi
+
+   if [ -n "$(echo $dest_port |grep -E '\-|\:' 2>/dev/null)" ]; then
+      LOG_WARN "Because there is a port range【$dest_port】in the firewall rule settings【$name】auto bypassing may cause the normal connection of the client not to reach the core, if necessary, please add your own in the access control!"
+      return
+   fi
+
+   local e_udp=false
+   local e_tcp=false
+   for p in $proto; do
+       if [ $p == tcp ]; then e_tcp=true; fi
+       if [ $p == udp ]; then e_udp=true; fi
+       if [ $p == all ]; then e_tcp=true; e_udp=true; fi
+   done
+
+   if [ -z "$proto" ]; then e_tcp=true; e_udp=true; fi
+
+   if ! $e_udp && ! $e_tcp ; then
+       return
+   fi
+
+   if [ -n "$FW4" ]; then
+      if $e_tcp ; then
+         nft insert rule inet fw4 clashnivo_output position 0 ip saddr { "$dest_ip" } tcp sport "$dest_port" counter return
+      fi
+      if $e_udp ; then
+         nft insert rule inet fw4 clashnivo_mangle_output position 0 ip saddr { "$dest_ip" } udp sport "$dest_port" counter return
+         if [ -n "$dest_ip" ]; then
+            nft insert rule inet fw4 clashnivo_mangle position 0 ip saddr { "$dest_ip" } udp sport "$dest_port" counter return
+         fi
+      fi
+   else
+      dest_port=$(echo $dest_port |sed "s/-/:/g" 2>/dev/null)
+      dest_ip=$(echo $dest_ip |sed "s/ /,/g" 2>/dev/null)
+      [ -n "$dest_ip" ] && dest_ip="-s ${dest_ip}"
+
+      if $e_tcp ; then
+         iptables -t nat -I clashnivo_output "$dest_ip" -p tcp --sport "$dest_port" -j RETURN
+      fi
+      if $e_udp ; then
+         iptables -t mangle -I clashnivo_output "$dest_ip" -p udp --sport "$dest_port" -j RETURN
+         if [ -n "$dest_ip" ]; then
+            iptables -t mangle -I clashnivo "$dest_ip" -p udp --sport "$dest_port" -j RETURN
+         fi
+      fi
+   fi
+} >/dev/null 2>&1
+
+set_firewall()
+{
+
+if [ -z "$(uci -q get firewall.clashnivo)" ] || [ -z "$(uci -q get ucitrack.@clashnivo[-1].init)" ]; then
+   uci -q delete ucitrack.@clashnivo[-1]
+   uci -q add ucitrack clashnivo
+   uci -q set ucitrack.@clashnivo[-1].init=clashnivo
+   uci -q commit ucitrack
+   uci -q delete firewall.clashnivo
+   uci -q set firewall.clashnivo=include
+   uci -q set firewall.clashnivo.type=script
+   uci -q set firewall.clashnivo.path=/var/etc/clashnivo.include
+   [ -n "$FW4" ] || uci -q set firewall.clashnivo.reload=1
+   uci -q commit firewall
+fi
+
+mkdir -p /var/etc
+cat > "/var/etc/clashnivo.include" <<-EOF
+/etc/init.d/clashnivo reload "firewall"
+EOF
+
+if [ -n "$common_ports" ] && [ "$common_ports" != "0" ]; then
+   if [ "$common_ports" = "1" ]; then
+      common_port="21 22 23 53 80 123 143 194 443 465 587 853 993 995 998 2052 2053 2082 2083 2086 2095 2096 5222 5228 5229 5230 8080 8443 8880 8888 8889"
+   else
+      common_port=$common_ports
+   fi
+fi
+
+case $enable_redirect_dns in
+   "1")
+   LOG_TIP "DNS Hijacking Mode is Dnsmasq Redirect..."
+   ;;
+   "2")
+   LOG_TIP "DNS Hijacking Mode is Firewall Redirect..."
+   ;;
+   *)
+   LOG_TIP "DNS Hijacking is Disabled..."
+esac
+
+if [ -n "$FW4" ]; then
+   LOG_TIP "Firewall4 was Detected, Use NFTABLE Rules..."
+
+   if [ "$lan_ac_mode" = "0" ]; then
+      if [ -n "$(uci_get_config "lan_ac_black_ips")" ]; then
+         nft 'add set inet fw4 lan_ac_black_ips { type ipv4_addr; flags interval; auto-merge; }'
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_black_ips" nft_ac_add "lan_ac_black_ips"
+      fi
+      if [ -n "$(uci_get_config "lan_ac_black_macs")" ]; then
+         nft 'add set inet fw4 lan_ac_black_macs { type ether_addr; }'
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_black_macs" nft_ac_add "lan_ac_black_macs"
+      fi
+   elif [ "$lan_ac_mode" = "1" ]; then
+      if [ -n "$(uci_get_config "lan_ac_white_ips")" ]; then
+         nft 'add set inet fw4 lan_ac_white_ips { type ipv4_addr; flags interval; auto-merge; }'
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_white_ips" nft_ac_add "lan_ac_white_ips"
+      fi
+      if [ -n "$(uci_get_config "lan_ac_white_macs")" ]; then
+         nft 'add set inet fw4 lan_ac_white_macs { type ether_addr; }'
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_white_macs" nft_ac_add "lan_ac_white_macs"
+      fi
+   fi
+
+   if [ -n "$(uci_get_config "wan_ac_black_ips")" ]; then
+      nft 'add set inet fw4 wan_ac_black_ips { type ipv4_addr; flags interval; auto-merge; }'
+      config_load "clashnivo"
+      config_list_foreach "config" "wan_ac_black_ips" nft_ac_add "wan_ac_black_ips"
+   fi
+
+   if [ -n "$(uci_get_config "wan_ac_black_ports")" ]; then
+      nft 'add set inet fw4 wan_ac_black_ports { type inet_service; flags interval; }'
+      config_load "clashnivo"
+      config_list_foreach "config" "wan_ac_black_ports" nft_ac_add "wan_ac_black_ports"
+   fi
+
+   nft 'add set inet fw4 localnetwork { type ipv4_addr; flags interval; auto-merge; }'
+   if [ -f "/etc/clashnivo/custom/clashnivo_custom_localnetwork_ipv4.list" ]; then
+      for line in `cat "/etc/clashnivo/custom/clashnivo_custom_localnetwork_ipv4.list"`
+      do
+         nft add element inet fw4 localnetwork { "$line" }
+      done
+   else
+      nft 'add element inet fw4 localnetwork { 0.0.0.0/8, 127.0.0.0/8, 10.0.0.0/8, 169.254.0.0/16, 192.168.0.0/16, 224.0.0.0/4, 240.0.0.0/4, 172.16.0.0/12, 100.64.0.0/10}'
+   fi
+
+   if [ -n "$wan_ip4s" ]; then
+      for wan_ip4 in $wan_ip4s; do
+         nft add element inet fw4 localnetwork { "$wan_ip4" }
+      done
+   fi
+
+   if [ -n "$common_ports" ] && [ "$common_ports" != "0" ]; then
+      nft 'add set inet fw4 common_ports { type inet_service; flags interval; }'
+      for i in $common_port; do
+         nft add element inet fw4 common_ports { "$i" }
+      done
+   fi
+
+   if [ "$bypass_gateway_compatible" -eq 1 ]; then
+      nft 'add chain inet fw4 clashnivo_post'
+      nft 'flush chain inet fw4 clashnivo_post'
+      nft 'add rule inet fw4 clashnivo_post skgid == 65534 counter return'
+      nft add rule inet fw4 clashnivo_post mark "$PROXY_FWMARK" counter accept
+      nft 'add rule inet fw4 clashnivo_post ip daddr @localnetwork counter return'
+      nft 'add rule inet fw4 clashnivo_post ct direction reply counter return'
+      nft 'add rule inet fw4 clashnivo_post fib saddr type != { local } counter masquerade'
+      nft add rule inet fw4 srcnat meta nfproto {ipv4} counter jump clashnivo_post comment \"Clash Nivo Bypass Gateway Compatible\"
+   fi
+
+   if [ "$intranet_allowed" -eq 1 ]; then
+      if [ -n "$intranet_allowed_wan_name" ] && [ "$intranet_allowed_wan_name" != "0" ]; then
+         config_load "clashnivo"
+         config_list_foreach "config" "intranet_allowed_wan_name" wan_name_add
+      else
+         wan_ints=$(nft list chain inet fw4 input |grep -e "jump input_wan" 2>/dev/null |awk '{for (i=1;i<=NF;i++){if ($i ~ /iifname/ && $(i+1) != "{") {print $(i+1)} if ($i ~ /iifname/ && $(i+1) == "{"){for (j=i+1;j<=NF;j++){if ($j~ /}/) {out="";for (k=i+1;k<=j;k++){out=out" "$k};print out}}}}}' 2>/dev/null |sed 's/"//g'|sed 's/{//g'|sed 's/}//g'|sed 's/,//g')
+      fi
+      if [ -n "$wan_ints" ]; then
+         nft 'add chain inet fw4 clashnivo_wan_input'
+         nft 'flush chain inet fw4 clashnivo_wan_input'
+         for wan_int in $wan_ints; do
+            nft insert rule inet fw4 input position 0 iifname "$wan_int" ip saddr != @localnetwork counter jump clashnivo_wan_input
+         done
+         nft add rule inet fw4 clashnivo_wan_input th dport {$proxy_port,$tproxy_port,$cn_port,$http_port,$socks_port,$mixed_port,$dns_port} counter reject
+      else
+         LOG_WARN "Can't Setting Only Intranet Allowed Function, Get IPv4 WAN Interfaces error, Please Verify The Firewall's WAN Zone Name is wan, Ignore This IF The Device Does not Have a WAN Interfaces..."
+      fi
+   fi
+
+   DNSPORT=$(uci -q get dhcp.@dnsmasq[0].port)
+   if [ -z "$DNSPORT" ]; then
+      DNSPORT=$(netstat -nlp |grep -E '127.0.0.1:.*dnsmasq' |awk -F '127.0.0.1:' '{print $2}' |awk '{print $1}' |head -1 || echo 53)
+   fi
+
+   if [ "$enable_redirect_dns" -eq 1 ]; then
+      if [ -z "$(nft list chain inet fw4 dstnat |grep 'Clash Nivo DNS Hijack')" ]; then
+         if [ "$lan_ac_mode" != "1" ]; then
+            ACBLACKDNSFILTER=""
+            if [ "$lan_ac_mode" = "0" ]; then
+               if [ -n "$(uci_get_config "lan_ac_black_ips")" ]; then
+                  ACBLACKDNSFILTER="ip saddr != @lan_ac_black_ips"
+               fi
+               if [ -n "$(uci_get_config "lan_ac_black_macs")" ]; then
+                  ACBLACKDNSFILTER="$ACBLACKDNSFILTER ether saddr != @lan_ac_black_macs"
+               fi
+            fi
+            nft insert rule inet fw4 dstnat position 0 meta l4proto {tcp,udp} th dport 53 ${ACBLACKDNSFILTER} counter redirect to "$DNSPORT" comment \"Clash Nivo DNS Hijack\"
+         else
+            nft insert rule inet fw4 dstnat position 0 meta l4proto {tcp,udp} th dport 53 ip saddr @lan_ac_white_ips counter redirect to "$DNSPORT" comment \"Clash Nivo DNS Hijack\"
+            nft insert rule inet fw4 dstnat position 0 meta l4proto {tcp,udp} th dport 53 ether saddr @lan_ac_white_macs counter redirect to "$DNSPORT" comment \"Clash Nivo DNS Hijack\"
+         fi
+      fi
+      if [ "$router_self_proxy" = 1 ]; then
+         nft 'add chain inet fw4 nat_output { type nat hook output priority -1; }'
+         nft insert rule inet fw4 nat_output position 0 skgid != 65534 meta l4proto {tcp,udp} th dport 53 ip daddr {127.0.0.1} counter redirect to "$DNSPORT" comment \"Clash Nivo DNS Hijack\"
+      fi
+   elif [ "$enable_redirect_dns" -eq 2 ]; then
+      nft 'add chain inet fw4 clashnivo_dns_redirect'
+      if [ "$lan_ac_mode" != "1" ]; then
+         ACBLACKDNSFILTER=""
+         if [ "$lan_ac_mode" = "0" ]; then
+            if [ -n "$(uci_get_config "lan_ac_black_ips")" ]; then
+               ACBLACKDNSFILTER="ip saddr != @lan_ac_black_ips"
+            fi
+            if [ -n "$(uci_get_config "lan_ac_black_macs")" ]; then
+               ACBLACKDNSFILTER="$ACBLACKDNSFILTER ether saddr != @lan_ac_black_macs"
+            fi
+         fi
+         nft add rule inet fw4 clashnivo_dns_redirect meta l4proto {tcp,udp} th dport 53 ${ACBLACKDNSFILTER} counter redirect to "$dns_port" comment \"Clash Nivo DNS Hijack\"
+      else
+         nft add rule inet fw4 clashnivo_dns_redirect meta l4proto {tcp,udp} th dport 53 ip saddr @lan_ac_white_ips counter redirect to "$dns_port" comment \"Clash Nivo DNS Hijack\"
+         nft add rule inet fw4 clashnivo_dns_redirect meta l4proto {tcp,udp} th dport 53 ether saddr @lan_ac_white_macs counter redirect to "$dns_port" comment \"Clash Nivo DNS Hijack\"
+      fi
+      nft 'insert rule inet fw4 dstnat position 0 meta l4proto {tcp,udp} th dport 53 counter jump clashnivo_dns_redirect'
+      if [ "$router_self_proxy" = 1 ]; then
+         nft 'add chain inet fw4 nat_output { type nat hook output priority -1; }'
+         nft insert rule inet fw4 nat_output position 0 meta l4proto {tcp,udp} th dport 53 ip daddr {127.0.0.1} meta skgid != 65534 counter redirect to "$dns_port" comment \"Clash Nivo DNS Hijack\"
+      fi
+   fi
+
+   #tcp
+   nft 'add chain inet fw4 clashnivo'
+   nft 'flush chain inet fw4 clashnivo'
+   nft 'add rule inet fw4 clashnivo ip daddr @localnetwork counter return'
+   nft 'add rule inet fw4 clashnivo ct direction reply counter return'
+   nft add rule inet fw4 clashnivo ip protocol tcp ip daddr { "$fakeip_range" } counter redirect to "$proxy_port"
+   nft 'add rule inet fw4 clashnivo ip daddr @wan_ac_black_ips counter return'
+   nft 'add rule inet fw4 clashnivo th dport @wan_ac_black_ports counter return'
+   nft 'add rule inet fw4 clashnivo ip saddr @lan_ac_black_ips counter return'
+   nft 'add rule inet fw4 clashnivo ether saddr @lan_ac_black_macs counter return'
+   if [ "$lan_ac_mode" = "1" ] && [ -n "$(uci_get_config "lan_ac_white_ips")" ] && [ -n "$(uci_get_config "lan_ac_white_macs")" ]; then
+      nft 'add rule inet fw4 clashnivo ether saddr != @lan_ac_white_macs ip saddr != @lan_ac_white_ips counter return'
+   else
+      nft 'add rule inet fw4 clashnivo ether saddr != @lan_ac_white_macs counter return'
+      nft 'add rule inet fw4 clashnivo ip saddr != @lan_ac_white_ips counter return'
+   fi
+
+   if [ "$en_mode" = "redir-host" ]; then
+      nft 'add rule inet fw4 clashnivo th dport != @common_ports counter return'
+   fi
+
+   nft add rule inet fw4 clashnivo ip protocol tcp counter redirect to "$proxy_port"
+   nft 'add rule inet fw4 dstnat meta nfproto {ipv4} ip protocol tcp counter jump clashnivo'
+
+   #udp
+   if [ "$enable_udp_proxy" -eq 1 ]; then
+      check_mod "nft_tproxy"
+      ip rule add fwmark "$PROXY_FWMARK" table "$PROXY_ROUTE_TABLE"
+      ip route add local 0.0.0.0/0 dev lo table "$PROXY_ROUTE_TABLE"
+      nft 'add chain inet fw4 clashnivo_mangle'
+      nft 'flush chain inet fw4 clashnivo_mangle'
+      nft 'add chain inet fw4 clashnivo_upnp'
+      nft 'flush chain inet fw4 clashnivo_upnp'
+      upnp_exclude
+      nft 'add rule inet fw4 clashnivo_mangle ip daddr @localnetwork counter return'
+      nft 'add rule inet fw4 clashnivo_mangle ct direction reply counter return'
+      if [ "$en_mode" = "fake-ip" ]; then
+         nft add rule inet fw4 clashnivo_mangle meta l4proto { udp } ip daddr { "$fakeip_range" } mark set "$PROXY_FWMARK" tproxy ip to 127.0.0.1:"$tproxy_port" counter accept
+      fi
+      nft 'add rule inet fw4 clashnivo_mangle ip daddr @wan_ac_black_ips counter return'
+      nft 'add rule inet fw4 clashnivo_mangle th dport @wan_ac_black_ports counter return'
+      nft 'add rule inet fw4 clashnivo_mangle ip saddr @lan_ac_black_ips counter return'
+      nft 'add rule inet fw4 clashnivo_mangle ether saddr @lan_ac_black_macs counter return'
+      if [ "$lan_ac_mode" = "1" ] && [ -n "$(uci_get_config "lan_ac_white_ips")" ] && [ -n "$(uci_get_config "lan_ac_white_macs")" ]; then
+         nft 'add rule inet fw4 clashnivo_mangle ether saddr != @lan_ac_white_macs ip saddr != @lan_ac_white_ips counter return'
+      else
+         nft 'add rule inet fw4 clashnivo_mangle ether saddr != @lan_ac_white_macs counter return'
+         nft 'add rule inet fw4 clashnivo_mangle ip saddr != @lan_ac_white_ips counter return'
+      fi
+
+      if [ "$en_mode" = "redir-host" ]; then
+         nft 'add rule inet fw4 clashnivo_mangle th dport != @common_ports counter return'
+      fi
+
+      nft 'add rule inet fw4 clashnivo_mangle ip protocol udp counter jump clashnivo_upnp'
+      nft add rule inet fw4 clashnivo_mangle meta l4proto { udp } mark set "$PROXY_FWMARK" tproxy ip to 127.0.0.1:"$tproxy_port" counter accept
+      nft 'add rule inet fw4 mangle_prerouting meta nfproto {ipv4} ip protocol udp counter jump clashnivo_mangle'
+   fi
+   if [ "$enable_udp_proxy" -ne 1 ] && [ "$en_mode" = "fake-ip" ]; then
+      check_mod "nft_tproxy"
+      ip rule add fwmark "$PROXY_FWMARK" table "$PROXY_ROUTE_TABLE"
+      ip route add local 0.0.0.0/0 dev lo table "$PROXY_ROUTE_TABLE"
+      nft 'add chain inet fw4 clashnivo_mangle'
+      nft 'flush chain inet fw4 clashnivo_mangle'
+      nft add rule inet fw4 clashnivo_mangle meta l4proto { udp } ip daddr { "$fakeip_range" } mark set "$PROXY_FWMARK" tproxy ip to 127.0.0.1:"$tproxy_port" counter accept
+      nft 'add rule inet fw4 mangle_prerouting meta nfproto {ipv4} ip protocol udp counter jump clashnivo_mangle'
+   fi
+
+   #router self proxy udp
+   if ([ "$router_self_proxy" = "1" ] && [ "$enable_udp_proxy" -eq 1 ]) || ([ "$enable_redirect_dns" != "2" ] && [ "$en_mode" = "fake-ip" ]); then
+      nft 'add chain inet fw4 clashnivo_mangle_output'
+      nft 'flush chain inet fw4 clashnivo_mangle_output'
+      nft 'add rule inet fw4 clashnivo_mangle_output skgid == 65534 counter return'
+      nft 'add rule inet fw4 clashnivo_mangle_output ip daddr @localnetwork counter return'
+      nft 'add rule inet fw4 clashnivo_mangle_output ct direction reply counter return'
+      nft 'add rule inet fw4 clashnivo_mangle_output ip daddr @wan_ac_black_ips counter return'
+      nft 'add rule inet fw4 clashnivo_mangle_output th dport @wan_ac_black_ports counter return'
+      if [ "$en_mode" = "redir-host" ]; then
+         nft add rule inet fw4 clashnivo_mangle_output th dport != @common_ports counter return
+      fi
+      if [ "$en_mode" = "fake-ip" ]; then
+         nft add rule inet fw4 clashnivo_mangle_output meta l4proto { udp } ip daddr { "$fakeip_range" } mark set "$PROXY_FWMARK" counter accept
+      fi
+      if [ "$router_self_proxy" = "1" ] && [ "$enable_udp_proxy" -eq 1 ]; then
+         nft add rule inet fw4 clashnivo_mangle_output mark set "$PROXY_FWMARK" counter accept
+      fi
+      nft 'add rule inet fw4 mangle_output meta nfproto {ipv4} ip protocol udp counter jump clashnivo_mangle_output'
+   fi
+
+   #quic
+   if [ "$disable_udp_quic" -eq 1 ]; then
+      nft insert rule inet fw4 input position 0 udp dport 443 counter reject comment \"Clash Nivo QUIC REJECT\"
+   fi
+
+   #router self proxy tcp
+   if [ "$router_self_proxy" = "1" ] || ([ "$enable_redirect_dns" != "2" ] && [ "$en_mode" = "fake-ip" ]); then
+      nft 'add chain inet fw4 clashnivo_output'
+      nft 'flush chain inet fw4 clashnivo_output'
+      nft 'add rule inet fw4 clashnivo_output skgid == 65534 counter return'
+      nft 'add rule inet fw4 clashnivo_output ip daddr @localnetwork counter return'
+      nft 'add rule inet fw4 clashnivo_output ct direction reply counter return'
+      if [ "$en_mode" = "fake-ip" ]; then
+         nft add rule inet fw4 clashnivo_output ip protocol tcp ip daddr { "$fakeip_range" } counter redirect to "$proxy_port"
+      fi
+      if [ "$router_self_proxy" = "1" ]; then
+         nft 'add rule inet fw4 clashnivo_output ip daddr @wan_ac_black_ips counter return'
+         nft 'add rule inet fw4 clashnivo_output th dport @wan_ac_black_ports counter return'
+         if [ "$en_mode" = "redir-host" ]; then
+            nft add rule inet fw4 clashnivo_output th dport != @common_ports counter return
+         fi
+         nft add rule inet fw4 clashnivo_output ip protocol tcp counter redirect to "$proxy_port"
+      fi
+      nft 'add chain inet fw4 nat_output { type nat hook output priority -1; }'
+      nft 'add rule inet fw4 nat_output meta nfproto {ipv4} ip protocol tcp counter jump clashnivo_output'
+   fi
+fi
+
+#IPTABLES
+if [ -z "$FW4" ]; then
+   if [ "$iptables_compat" -eq 0 ]; then
+      owner="-m mark --mark 0x1a0a"
+      noowner="-m mark ! --mark 0x1a0a"
+      addr_local="! -i lo"
+   else
+      owner="-m owner --gid-owner 65534"
+      noowner="-m owner ! --gid-owner 65534"
+      addr_local="-m addrtype ! --src-type LOCAL"
+   fi
+
+   if [ "$lan_ac_mode" = "0" ]; then
+      if [ -n "$(uci_get_config "lan_ac_black_ips")" ]; then
+         ipset create lan_ac_black_ips hash:net
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_black_ips" ac_add "lan_ac_black_ips"
+      fi
+      if [ -n "$(uci_get_config "lan_ac_black_macs")" ]; then
+         ipset create lan_ac_black_macs hash:mac
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_black_macs" ac_add "lan_ac_black_macs"
+      fi
+   elif [ "$lan_ac_mode" = "1" ]; then
+      if [ -n "$(uci_get_config "lan_ac_white_ips")" ]; then
+         ipset create lan_ac_white_ips hash:net
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_white_ips" ac_add "lan_ac_white_ips"
+      fi
+      if [ -n "$(uci_get_config "lan_ac_white_macs")" ]; then
+         ipset create lan_ac_white_macs hash:mac
+         config_load "clashnivo"
+         config_list_foreach "config" "lan_ac_white_macs" ac_add "lan_ac_white_macs"
+      fi
+   fi
+
+   if [ -n "$(uci_get_config "wan_ac_black_ips")" ]; then
+      ipset create wan_ac_black_ips hash:net
+      config_load "clashnivo"
+      config_list_foreach "config" "wan_ac_black_ips" ac_add "wan_ac_black_ips"
+   fi
+
+   if [ -n "$(uci_get_config "wan_ac_black_ports")" ]; then
+      ipset create wan_ac_black_ports bitmap:port range 0-65535
+      config_load "clashnivo"
+      config_list_foreach "config" "wan_ac_black_ports" ac_add "wan_ac_black_ports"
+   fi
+
+   ipset create localnetwork hash:net
+   if [ -f "/etc/clashnivo/custom/clashnivo_custom_localnetwork_ipv4.list" ]; then
+      for line in `cat "/etc/clashnivo/custom/clashnivo_custom_localnetwork_ipv4.list"`
+      do
+         ipset add localnetwork "$line"
+      done
+   else
+      ipset add localnetwork 0.0.0.0/8
+      ipset add localnetwork 127.0.0.0/8
+      ipset add localnetwork 10.0.0.0/8
+      ipset add localnetwork 169.254.0.0/16
+      ipset add localnetwork 192.168.0.0/16
+      ipset add localnetwork 224.0.0.0/4
+      ipset add localnetwork 240.0.0.0/4
+      ipset add localnetwork 172.16.0.0/12
+      ipset add localnetwork 100.64.0.0/10
+   fi
+
+   if [ -n "$wan_ip4s" ]; then
+      for wan_ip4 in $wan_ip4s; do
+         ipset add localnetwork "$wan_ip4"
+      done
+   fi
+
+   if [ -n "$common_ports" ] && [ "$common_ports" != "0" ]; then
+      ipset create common_ports bitmap:port range 0-65535
+      for i in $common_port; do
+         ipset add common_ports $i
+      done
+   fi
+
+   if [ "$bypass_gateway_compatible" -eq 1 ]; then
+      iptables -t nat -N clashnivo_post
+      iptables -t nat -F clashnivo_post
+      iptables -t nat -A clashnivo_post $owner -j RETURN
+      iptables -t nat -A clashnivo_post -m mark --mark "$PROXY_FWMARK" -j ACCEPT
+      iptables -t nat -A clashnivo_post -m set --match-set localnetwork dst -j RETURN
+      iptables -t nat -A clashnivo_post -m conntrack --ctdir REPLY -j RETURN
+      iptables -t nat -A clashnivo_post $addr_local -j MASQUERADE
+      iptables -t nat -A POSTROUTING -m comment --comment "Clash Nivo Bypass Gateway Compatible" -j clashnivo_post
+   fi
+
+   if [ "$intranet_allowed" -eq 1 ]; then
+      if [ -n "$intranet_allowed_wan_name" ] && [ "$intranet_allowed_wan_name" != "0" ]; then
+         config_load "clashnivo"
+         config_list_foreach "config" "intranet_allowed_wan_name" wan_name_add
+      else
+         wan_ints=$(iptables-save -t filter |grep -e "-j zone_wan_input" 2>/dev/null |awk '{for (i=1;i<=NF;i++) {if ($i ~ /-i/) {print $(i+1)}}}' 2>/dev/null)
+      fi
+      if [ -n "$wan_ints" ]; then
+         iptables -t filter -N clashnivo_wan_input
+         iptables -t filter -F clashnivo_wan_input
+         for wan_int in $wan_ints; do
+            iptables -t filter -I INPUT -i "$wan_int" -m set ! --match-set localnetwork src -j clashnivo_wan_input
+         done
+         iptables -t filter -A clashnivo_wan_input -p udp -m multiport --dport "$proxy_port,$tproxy_port,$cn_port,$http_port,$socks_port,$mixed_port,$dns_port" -j REJECT
+         iptables -t filter -A clashnivo_wan_input -p tcp -m multiport --dport "$proxy_port,$tproxy_port,$cn_port,$http_port,$socks_port,$mixed_port,$dns_port" -j REJECT
+      else
+         LOG_WARN "Can't Setting Only Intranet Allowed Function, Get IPv4 WAN Interfaces error, Please Verify The Firewall's WAN Zone Name is wan, Ignore This IF The Device Does not Have a WAN Interfaces..."
+      fi
+   fi
+
+   DNSPORT=$(uci -q get dhcp.@dnsmasq[0].port)
+   if [ -z "$DNSPORT" ]; then
+      DNSPORT=$(netstat -nlp |grep -E '127.0.0.1:.*dnsmasq' |awk -F '127.0.0.1:' '{print $2}' |awk '{print $1}' |head -1 || echo 53)
+   fi
+
+   if [ "$enable_redirect_dns" -eq 1 ]; then
+      if [ -z "$(iptables -t nat -nL PREROUTING --line-number |grep 'Clash Nivo DNS Hijack')" ]; then
+         if [ "$lan_ac_mode" != "1" ]; then
+            ACBLACKDNSFILTER=""
+            if [ "$lan_ac_mode" = "0" ]; then
+               if [ -n "$(uci_get_config "lan_ac_black_ips")" ]; then
+                  ACBLACKDNSFILTER="-m set ! --match-set lan_ac_black_ips src"
+               fi
+               if [ -n "$(uci_get_config "lan_ac_black_macs")" ]; then
+                  ACBLACKDNSFILTER="$ACBLACKDNSFILTER -m set ! --match-set lan_ac_black_macs src"
+               fi
+            fi
+            iptables -t nat -I PREROUTING -p udp --dport 53 ${ACBLACKDNSFILTER} -j REDIRECT --to-ports "$DNSPORT" -m comment --comment "Clash Nivo DNS Hijack"
+            iptables -t nat -I PREROUTING -p tcp --dport 53 ${ACBLACKDNSFILTER} -j REDIRECT --to-ports "$DNSPORT" -m comment --comment "Clash Nivo DNS Hijack"
+         else
+            iptables -t nat -I PREROUTING -p udp --dport 53 -m set --match-set lan_ac_white_ips src -j REDIRECT --to-ports "$DNSPORT" -m comment --comment "Clash Nivo DNS Hijack"
+            iptables -t nat -I PREROUTING -p tcp --dport 53 -m set --match-set lan_ac_white_ips src -j REDIRECT --to-ports "$DNSPORT" -m comment --comment "Clash Nivo DNS Hijack"
+            iptables -t nat -I PREROUTING -p udp --dport 53 -m set --match-set lan_ac_white_macs src -j REDIRECT --to-ports "$DNSPORT" -m comment --comment "Clash Nivo DNS Hijack"
+            iptables -t nat -I PREROUTING -p tcp --dport 53 -m set --match-set lan_ac_white_macs src -j REDIRECT --to-ports "$DNSPORT" -m comment --comment "Clash Nivo DNS Hijack"
+         fi
+      fi
+      if [ "$router_self_proxy" = 1 ]; then
+         iptables -t nat -I OUTPUT $noowner -m comment --comment "Clash Nivo DNS Hijack" -p tcp --dport 53 -d 127.0.0.1 -j REDIRECT --to-ports "$DNSPORT"
+         iptables -t nat -I OUTPUT $noowner -m comment --comment "Clash Nivo DNS Hijack" -p udp --dport 53 -d 127.0.0.1 -j REDIRECT --to-ports "$DNSPORT"
+      fi
+   elif [ "$enable_redirect_dns" -eq 2 ]; then
+      iptables -t nat -N clashnivo_dns_redirect
+      iptables -t nat -F clashnivo_dns_redirect
+      if [ "$lan_ac_mode" != "1" ]; then
+         ACBLACKDNSFILTER=""
+         if [ "$lan_ac_mode" = "0" ]; then
+            if [ -n "$(uci_get_config "lan_ac_black_ips")" ]; then
+               ACBLACKDNSFILTER="-m set ! --match-set lan_ac_black_ips src"
+            fi
+            if [ -n "$(uci_get_config "lan_ac_black_macs")" ]; then
+               ACBLACKDNSFILTER="$ACBLACKDNSFILTER -m set ! --match-set lan_ac_black_macs src"
+            fi
+         fi
+         iptables -t nat -A clashnivo_dns_redirect -p udp --dport 53 ${ACBLACKDNSFILTER} -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+         iptables -t nat -A clashnivo_dns_redirect -p tcp --dport 53 ${ACBLACKDNSFILTER} -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+      else
+         iptables -t nat -A clashnivo_dns_redirect -p udp --dport 53 -m set --match-set lan_ac_white_ips src -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+         iptables -t nat -A clashnivo_dns_redirect -p tcp --dport 53 -m set --match-set lan_ac_white_ips src -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+         iptables -t nat -A clashnivo_dns_redirect -p udp --dport 53 -m set --match-set lan_ac_white_macs src -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+         iptables -t nat -A clashnivo_dns_redirect -p tcp --dport 53 -m set --match-set lan_ac_white_macs src -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+      fi
+      iptables -t nat -I PREROUTING -p udp --dport 53 -j clashnivo_dns_redirect
+      iptables -t nat -I PREROUTING -p tcp --dport 53 -j clashnivo_dns_redirect
+      if [ "$router_self_proxy" = 1 ]; then
+         iptables -t nat -I OUTPUT -p udp --dport 53 -d 127.0.0.1 $noowner -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+         iptables -t nat -I OUTPUT -p tcp --dport 53 -d 127.0.0.1 $noowner -j REDIRECT --to-ports "$dns_port" -m comment --comment "Clash Nivo DNS Hijack"
+      fi
+   fi
+
+   #tcp
+   iptables -t nat -N clashnivo
+   iptables -t nat -F clashnivo
+   iptables -t nat -A clashnivo -m set --match-set localnetwork dst -j RETURN
+   iptables -t nat -A clashnivo -m conntrack --ctdir REPLY -j RETURN
+   iptables -t nat -A clashnivo -p tcp -d "$fakeip_range" -j REDIRECT --to-ports "$proxy_port"
+   iptables -t nat -A clashnivo -m set --match-set wan_ac_black_ips dst -j RETURN
+   iptables -t nat -A clashnivo -m set --match-set wan_ac_black_ports dst -j RETURN
+   iptables -t nat -A clashnivo -m set --match-set lan_ac_black_ips src -j RETURN
+   iptables -t nat -A clashnivo -m set --match-set lan_ac_black_macs src -j RETURN
+   if [ "$lan_ac_mode" = "1" ] && [ -n "$(uci_get_config "lan_ac_white_ips")" ] && [ -n "$(uci_get_config "lan_ac_white_macs")" ]; then
+      iptables -t nat -A clashnivo -m set ! --match-set lan_ac_white_ips src -m set ! --match-set lan_ac_white_macs src -j RETURN
+   else
+      iptables -t nat -A clashnivo -m set ! --match-set lan_ac_white_ips src -j RETURN
+      iptables -t nat -A clashnivo -m set ! --match-set lan_ac_white_macs src -j RETURN
+   fi
+   if [ "$en_mode" = "redir-host" ]; then
+      iptables -t nat -A clashnivo -m set ! --match-set common_ports dst -j RETURN
+   fi
+   iptables -t nat -A clashnivo -p tcp -j REDIRECT --to-ports "$proxy_port"
+   iptables -t nat -A PREROUTING -p tcp -j clashnivo
+
+   #udp
+   if [ "$enable_udp_proxy" -eq 1 ]; then
+      check_mod "xt_TPROXY"
+      ip rule add fwmark "$PROXY_FWMARK" table "$PROXY_ROUTE_TABLE"
+      ip route add local 0.0.0.0/0 dev lo table "$PROXY_ROUTE_TABLE"
+      iptables -t mangle -N clashnivo
+      iptables -t mangle -F clashnivo
+      iptables -t mangle -N clashnivo_upnp
+      iptables -t mangle -F clashnivo_upnp
+      upnp_exclude
+      iptables -t mangle -A clashnivo -m set --match-set localnetwork dst -j RETURN
+      iptables -t mangle -A clashnivo -m conntrack --ctdir REPLY -j RETURN
+      if [ "$en_mode" = "fake-ip" ]; then
+         iptables -t mangle -A clashnivo -p udp -d "$fakeip_range" -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$PROXY_FWMARK"
+      fi
+      iptables -t mangle -A clashnivo -m set --match-set wan_ac_black_ips dst -j RETURN
+      iptables -t mangle -A clashnivo -m set --match-set wan_ac_black_ports dst -j RETURN
+      iptables -t mangle -A clashnivo -m set --match-set lan_ac_black_macs src -j RETURN
+      iptables -t mangle -A clashnivo -m set --match-set lan_ac_black_ips src -j RETURN
+      if [ "$lan_ac_mode" = "1" ] && [ -n "$(uci_get_config "lan_ac_white_ips")" ] && [ -n "$(uci_get_config "lan_ac_white_macs")" ]; then
+         iptables -t mangle -A clashnivo -m set ! --match-set lan_ac_white_ips src -m set ! --match-set lan_ac_white_macs src -j RETURN
+      else
+         iptables -t mangle -A clashnivo -m set ! --match-set lan_ac_white_ips src -j RETURN
+         iptables -t mangle -A clashnivo -m set ! --match-set lan_ac_white_macs src -j RETURN
+      fi
+      if [ "$en_mode" = "redir-host" ]; then
+         iptables -t mangle -A clashnivo -m set ! --match-set common_ports dst -j RETURN
+      fi
+      iptables -t mangle -A clashnivo -p udp -j clashnivo_upnp
+      iptables -t mangle -A clashnivo -p udp -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$PROXY_FWMARK"
+      iptables -t mangle -A PREROUTING -p udp -j clashnivo
+   fi
+
+   if [ "$enable_udp_proxy" -ne 1 ] && [ "$en_mode" = "fake-ip" ]; then
+      check_mod "xt_TPROXY"
+      ip rule add fwmark "$PROXY_FWMARK" table "$PROXY_ROUTE_TABLE"
+      ip route add local 0.0.0.0/0 dev lo table "$PROXY_ROUTE_TABLE"
+      iptables -t mangle -N clashnivo
+      iptables -t mangle -F clashnivo
+      iptables -t mangle -A clashnivo -p udp -d "$fakeip_range" -j TPROXY --on-port "$tproxy_port" --tproxy-mark "$PROXY_FWMARK"
+      iptables -t mangle -A PREROUTING -p udp -j clashnivo
+   fi
+
+   #router self proxy udp
+   if ([ "$router_self_proxy" = "1" ] && [ "$enable_udp_proxy" -eq 1 ]) || ([ "$enable_redirect_dns" != "2" ] && [ "$en_mode" = "fake-ip" ]); then
+      iptables -t mangle -N clashnivo_output
+      iptables -t mangle -F clashnivo_output
+      iptables -t mangle -A clashnivo_output $owner -j RETURN
+      iptables -t mangle -A clashnivo_output -m set --match-set localnetwork dst -j RETURN
+      iptables -t mangle -A clashnivo_output -m conntrack --ctdir REPLY -j RETURN
+      iptables -t mangle -A clashnivo_output -m set --match-set wan_ac_black_ips dst -j RETURN
+      iptables -t mangle -A clashnivo_output -m set --match-set wan_ac_black_ports dst -j RETURN
+      if [ "$en_mode" = "fake-ip" ]; then
+         iptables -t mangle -A clashnivo_output -p udp -d "$fakeip_range" -j MARK --set-mark "$PROXY_FWMARK"
+      fi
+      if [ "$en_mode" = "redir-host" ]; then
+         iptables -t mangle -A clashnivo_output -m set ! --match-set common_ports dst -j RETURN
+      fi
+      if [ "$router_self_proxy" = "1" ] && [ "$enable_udp_proxy" -eq 1 ]; then
+         iptables -t mangle -A clashnivo_output -p udp -j MARK --set-mark "$PROXY_FWMARK"
+      fi
+      iptables -t mangle -A OUTPUT -p udp -j clashnivo_output
+   fi
+
+   #quic
+   if [ "$disable_udp_quic" -eq 1 ]; then
+      iptables -I INPUT -p udp --dport 443 -m comment --comment "Clash Nivo QUIC REJECT" -j REJECT
+   fi
+
+   #router self proxy tcp
+   if [ "$router_self_proxy" = "1" ] || ([ "$enable_redirect_dns" != "2" ] && [ "$en_mode" = "fake-ip" ]); then
+      iptables -t nat -N clashnivo_output
+      iptables -t nat -F clashnivo_output
+      iptables -t nat -A clashnivo_output $owner -j RETURN
+      if [ "$en_mode" = "fake-ip" ]; then
+         iptables -t nat -A clashnivo_output -p tcp -d "$fakeip_range" -j REDIRECT --to-ports "$proxy_port"
+      fi
+      if [ "$router_self_proxy" = "1" ]; then
+         iptables -t nat -A clashnivo_output -m set --match-set localnetwork dst -j RETURN
+         iptables -t nat -A clashnivo_output -m conntrack --ctdir REPLY -j RETURN
+         iptables -t nat -A clashnivo_output -m set --match-set wan_ac_black_ips dst -j RETURN
+         iptables -t nat -A clashnivo_output -m set --match-set wan_ac_black_ports dst -j RETURN
+         if [ "$en_mode" = "redir-host" ]; then
+            iptables -t nat -A clashnivo_output -m set ! --match-set common_ports dst -j RETURN
+         fi
+         iptables -t nat -A clashnivo_output -p tcp -j REDIRECT --to-ports "$proxy_port"
+      fi
+      iptables -t nat -A OUTPUT -j clashnivo_output
+   fi
+fi
+
+config_load "clashnivo"
+config_foreach firewall_lan_ac_traffic "lan_ac_ip"
+config_load "firewall"
+config_foreach firewall_rule_exclude "rule"
+config_foreach firewall_redirect_exclude "redirect"
+
+uci -q set clashnivo.config.firewall_enable=1
+uci -q commit clashnivo
+} >/dev/null 2>&1
+
+revert_firewall()
+{
+   rm -rf /var/etc/clashnivo.include
+
+   ip rule del fwmark "$PROXY_FWMARK" table "$PROXY_ROUTE_TABLE"
+   ip route del local 0.0.0.0/0 dev lo table "$PROXY_ROUTE_TABLE"
+
+   if [ -n "$FW4" ]; then
+      for nft in "input" "forward" "output" "dstnat" "srcnat" "nat_output" "mangle_prerouting" "mangle_output"; do
+         local handles=$(nft -a list chain inet fw4 ${nft} |grep -E "clashnivo|Clash Nivo" |awk -F '# handle ' '{print$2}')
+         for handle in $handles; do
+            nft delete rule inet fw4 ${nft} handle ${handle}
+         done
+      done
+
+      for handle in $(nft -a list chains |grep -E "chain clashnivo|Clash Nivo" |awk -F '# handle ' '{print$2}'); do
+         nft delete chain inet fw4 handle ${handle}
+      done
+
+      for handle in $(nft -a list sets |grep -E "set localnetwork|lan_ac_|wan_ac_black_|common_ports" |awk -F '# handle ' '{print$2}'); do
+         nft delete set inet fw4 handle ${handle}
+      done
+   else
+      for ipt in "iptables -nvL INPUT" "iptables -nvL FORWARD" "iptables -nvL OUTPUT" "iptables -nvL POSTROUTING -t nat" "iptables -nvL OUTPUT -t nat" "iptables -nvL OUTPUT -t mangle" "iptables -nvL PREROUTING -t nat" "iptables -nvL PREROUTING -t mangle"; do
+         for comment in "clashnivo" "Clash Nivo"; do
+            local lines=$($ipt |sed 1,2d |sed -n "/${comment}/=" 2>/dev/null |sort -rn)
+            if [ -n "$lines" ]; then
+               for line in $lines; do
+                  $(echo "$ipt" |awk -v OFS=" " '{print $1,$4,$5}' |sed 's/[ ]*$//g') -D $(echo "$ipt" |awk '{print $3}') $line
+               done
+            fi
+         done
+      done
+
+      for chain in "clashnivo" "clashnivo_output" "clashnivo_post" "clashnivo_wan_input" "clashnivo_dns_redirect" "clashnivo_upnp" "clashnivo_mangle" "clashnivo_mangle_output"; do
+         iptables -t nat -F $chain
+         iptables -t nat -X $chain
+         iptables -t mangle -F $chain
+         iptables -t mangle -X $chain
+         iptables -t filter -F $chain
+         iptables -t filter -X $chain
+      done
+
+      ipset destroy localnetwork
+      ipset destroy lan_ac_white_ips
+      ipset destroy lan_ac_black_ips
+      ipset destroy lan_ac_white_macs
+      ipset destroy lan_ac_black_macs
+      ipset destroy wan_ac_black_ips
+      ipset destroy wan_ac_black_ports
+      ipset destroy common_ports
+   fi
+} >/dev/null 2>&1
+
+add_overwrite_cron()
+{
+   local section="$1" enable type day hour url name
+   config_get_bool "enable" "$section" "enable" "1"
+   config_get "type" "$section" "type" "file"
+   config_get "url" "$section" "url" ""
+   config_get "update_days" "$section" "update_days" ""
+   config_get "update_hour" "$section" "update_hour" ""
+   config_get "name" "$section" "name" ""
+
+   if [ "$enable" != "1" ] || [ -z "$name" ] || [ "$type" != "http" ] || [ -z "$url" ] || [ -z "$update_days" ] || [ -z "$update_hour" ] || [ "$update_days" = "off" ] || [ "$update_hour" = "off" ]; then
+      return
+   fi
+
+   eval "restart_flag=\${OVERWRITE_RESTART_FLAG_${name}}"
+   cron_cmd="$cron source /usr/share/clashnivo/clashnivo_curl.sh && DOWNLOAD_FILE_CURL \"$url\" \"/etc/clashnivo/overwrite/$name\" \"/etc/clashnivo/overwrite/$name\""
+   if [ "$restart_flag" = "1" ]; then
+      cron_cmd="$cron_cmd && [ \"\$?\" -eq 0 ] && /etc/init.d/clashnivo restart"
+   fi
+   cron_cmd="$cron_cmd #clashnivo-overwrite-download"
+
+   echo "0 $update_hour * * $update_days $cron_cmd" >> $CRON_FILE
+}
+
+check_type() {
+   local key="$1"
+   local value="$2"
+   local type=$(echo "$allowed_types_map" | grep "^${key}:" | cut -d: -f2)
+   case "$type" in
+      int)
+         echo "$value" | grep -Eq '^[0-9]+$'
+         return $?
+         ;;
+      int_bool)
+         [[ "$value" == "0" || "$value" == "1" ]]
+         return $?
+         ;;
+      bool)
+         [[ "$value" == "true" || "$value" == "false" ]]
+         return $?
+         ;;
+      string|*)
+         return 0
+         ;;
+   esac
+}
+
+overwrite_config_match_check()
+{
+   local section="$1" name config
+   config_get "name" "$section" "name" ""
+   config_get "config" "$section" "config" ""
+
+   [ -z "$name" ] || [ "$name" != "$2" ] || [ -z "$config" ] && return
+
+   config_list_foreach "$section" "config" overwrite_config_match_item
+}
+
+overwrite_config_match_item()
+{
+   local config_path_item="$1"
+
+   [ -z "$config_path_item" ] && return
+   [ "$config_path_item" = "all" ] && OVERWRITE_CONFIG_MATCHED=1 && return
+   [ "$config_path_item" = "$(uci_get_config "config_path")" ] && OVERWRITE_CONFIG_MATCHED=1
+}
+
+overwrite_file()
+{
+   clear_overwrite_set
+
+   overwrite_script="/tmp/yaml_overwrite.sh"
+   cat > "$overwrite_script" <<'EOF'
+#!/bin/sh
+. /usr/share/clashnivo/ruby.sh
+. /usr/share/clashnivo/log.sh
+. /lib/functions.sh
+
+EOF
+
+   allowed_keys_types="\
+   CONFIG_FILE:string \
+   LAN_INTERFACE_NAME:string \
+   INTERFACE_NAME:string \
+   CN_PORT:int \
+   DA_PASSWORD:string \
+   PROXY_PORT:int \
+   TPROXY_PORT:int \
+   HTTP_PORT:int \
+   SOCKS_PORT:int \
+   MIXED_PORT:int \
+   DNS_PORT:int \
+   ENABLE_REDIRECT_DNS:int_bool \
+   ENABLE_CUSTOM_DNS:int_bool \
+   APPEND_DEFAULT_DNS:int_bool \
+   APPEND_WAN_DNS:int_bool \
+   STORE_FAKEIP:int_bool \
+   CUSTOM_FAKEIP_FILTER:int_bool \
+   CUSTOM_FAKEIP_FILTER_MODE:string \
+   FAKEIP_RANGE:string \
+   ENABLE_RESPECT_RULES:int_bool \
+   CUSTOM_NAME_POLICY:int_bool \
+   CUSTOM_HOST:int_bool \
+   CUSTOM_FALLBACK_FILTER:int_bool \
+   OPERATION_MODE:string \
+   ENABLE_UDP_PROXY:int_bool \
+   DISABLE_UDP_QUIC:int_bool \
+   ROUTER_SELF_PROXY:int_bool \
+   STACK_TYPE:string \
+   PROXY_MODE:string \
+   INTRANET_ALLOWED:int_bool \
+   INTRANET_ALLOWED_WAN_NAME:string \
+   BYPASS_GATEWAY_COMPATIBLE:int_bool \
+   COMMON_PORTS:string \
+   ENABLE_META_SNIFFER:int_bool \
+   ENABLE_META_SNIFFER_CUSTOM:int_bool \
+   ENABLE_META_SNIFFER_PURE_IP:int_bool \
+   ENABLE_TCP_CONCURRENT:int_bool \
+   FIND_PROCESS_MODE:string \
+   ENABLE_UNIFIED_DELAY:int_bool \
+   ENABLE_RULE_PROXY:int_bool \
+   ENABLE_CUSTOM_CLASH_RULES:int_bool \
+   TOLERANCE:int \
+   URLTEST_INTERVAL_MOD:int \
+   URLTEST_ADDRESS_MOD:string \
+   GITHUB_ADDRESS_MOD:string \
+   ENABLE_GEOIP_DAT:int_bool \
+   GEODATA_LOADER:string \
+   GEO_AUTO_UPDATE:int_bool \
+   GEO_UPDATE_WEEK_TIME:string \
+   GEO_UPDATE_DAY_TIME:string \
+   GEO_CUSTOM_URL:string \
+   GEOIP_AUTO_UPDATE:int_bool \
+   GEOIP_UPDATE_WEEK_TIME:string \
+   GEOIP_UPDATE_DAY_TIME:string \
+   GEOIP_CUSTOM_URL:string \
+   GEOSITE_AUTO_UPDATE:int_bool \
+   GEOSITE_UPDATE_WEEK_TIME:string \
+   GEOSITE_UPDATE_DAY_TIME:string \
+   GEOSITE_CUSTOM_URL:string \
+   GEOASN_AUTO_UPDATE:int_bool \
+   GEOASN_UPDATE_WEEK_TIME:string \
+   GEOASN_UPDATE_DAY_TIME:string \
+   GEOASN_CUSTOM_URL:string \
+   SMALL_FLASH_MEMORY:int_bool \
+   DISABLE_QUIC_GO_GSO:int_bool \
+   DELAY_START:int \
+   SKIP_PROXY_ADDRESS:int_bool \
+   SUB_INFO_URL:string \
+   DOWNLOAD_FILE:string \
+   RESTART:bool \
+   "
+
+   allowed_keys_list=$(echo "$allowed_keys_types" | tr ' ' '\n' | cut -d: -f1)
+   allowed_types_map=$(echo "$allowed_keys_types" | tr ' ' '\n')
+
+   uci -q add clashnivo overwrite >/dev/null 2>&1
+
+   overwrite_list=$(uci -q show clashnivo 2>/dev/null | grep "=config_overwrite" | awk -F'[.=]' '{print $2}' | while read -r sid; do
+      order=$(uci -q get clashnivo."$sid".order 2>/dev/null)
+      [ -z "$order" ] && order=0
+      name=$(uci -q get clashnivo."$sid".name 2>/dev/null)
+      enable_flag=$(uci -q get clashnivo."$sid".enable 2>/dev/null || echo 0)
+      printf "%s|%s|%s|%s\n" "$order" "$name" "$sid" "$enable_flag"
+   done | sort -nr -t'|' -k1,1)
+
+   for entry in $overwrite_list; do
+      name=$(echo "$entry" | cut -d'|' -f2)
+      sid=$(echo "$entry" | cut -d'|' -f3)
+      enabled_flag=$(echo "$entry" | cut -d'|' -f4)
+      OVERWRITE_CONFIG_MATCHED=0
+      config_load "clashnivo"
+      config_foreach overwrite_config_match_check "config_overwrite" "$name"
+
+      [ "$OVERWRITE_CONFIG_MATCHED" -eq 0 ] && continue
+      [ "$enabled_flag" != "1" ] && continue
+      [ -z "$name" ] && continue
+
+      file="/etc/clashnivo/overwrite/${name}"
+      [ ! -f "$file" ] && continue
+
+      LOG_TIP "Processing Overwrite Module【$name】"
+
+      echo "# --- overwrite source: ${name} (sid=${sid}) ---" >> "$overwrite_script"
+      echo "export CLASHNIVO_OVERWRITE_SID='${sid}'" >> "$overwrite_script"
+
+      param=$(uci -q get clashnivo."$sid".param 2>/dev/null || echo '')
+      if [ -n "$param" ]; then
+         OLD_IFS="$IFS"
+         IFS=';'
+         for kv in $param; do
+            [ -z "$kv" ] && continue
+            k="${kv%%=*}"
+            v="${kv#*=}"
+            k=$(printf "%s" "$k" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            v=$(printf "%s" "$v" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+            [ -z "$k" ] && continue
+            varname="$k"
+            v_escaped=$(printf "%s" "$v" | sed "s/'/'\"'\"'/g")
+            export ${varname}=${v_escaped}
+         done
+         IFS="$OLD_IFS"
+      fi
+
+      in_general=0
+      in_overwrite=0
+      in_yaml=0
+      download_file_lines=""
+
+      while IFS= read -r line || [ -n "$line" ]; do
+         trimmed=$(printf "%s" "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+         case "$trimmed" in
+               "[General]"*) in_general=1; in_overwrite=0; in_yaml=0; continue;;
+               "[Overwrite]"*) in_general=0; in_overwrite=1; in_yaml=0; continue;;
+               "[YAML]"*) in_general=0; in_overwrite=0; in_yaml=1; continue;;
+               "["*"]"*) in_general=0; in_overwrite=0; in_yaml=0; continue;;
+         esac
+         [ -z "$trimmed" ] && continue
+         echo "$trimmed" | grep -qE '^[#;]' && continue
+
+         if [ "$in_general" -eq 1 ]; then
+            key=$(printf "%s" "$trimmed" | awk -F'=' '{gsub(/[[:space:]]+$/,"",$1); print $1}' | sed 's/[[:space:]]*$//;s/ //g')
+            key_u=$(printf "%s" "$key" | tr 'a-z' 'A-Z' | tr -d ' ')
+            if printf "%s" "$key_u" | grep -q "^DOWNLOAD_FILE$"; then
+               download_file_lines="${download_file_lines}
+${trimmed}"
+            fi
+         fi
+      done < "$file"
+
+      download_failed=0
+      echo "$download_file_lines" | sed '/^$/d' | while IFS= read -r trimmed; do
+         key=$(printf "%s" "$trimmed" | awk -F'=' '{gsub(/[[:space:]]+$/,"",$1); print $1}' | sed 's/[[:space:]]*$//;s/ //g')
+         val=$(echo "$trimmed" | sed 's/^[^=]*=[[:space:]]*//')
+         key_u=$(printf "%s" "$key" | tr 'a-z' 'A-Z' | tr -d ' ')
+         url=$(eval "echo \"$(echo "$val" | sed -nE 's/.*url[[:space:]]*=[[:space:]]*([^,]*).*/\1/p')\"")
+         path=$(eval "echo \"$(echo "$val" | sed -nE 's/.*path[[:space:]]*=[[:space:]]*([^,]*).*/\1/p')\"")
+         cron=$(eval "echo \"$(echo "$val" | sed -nE 's/.*cron[[:space:]]*=[[:space:]]*([^,]*).*/\1/p')\"")
+         force=$(eval "echo \"$(echo "$val" | sed -nE 's/.*force[[:space:]]*=[[:space:]]*([^,]*).*/\1/p')\"")
+         ua=$(eval "echo \"$(echo "$val" | sed -nE 's/.*ua[[:space:]]*=[[:space:]]*([^,]*).*/\1/p')\"")
+         restart=$(eval "echo \"$(echo "$val" | sed -nE 's/.*restart[[:space:]]*=[[:space:]]*([^,]*).*/\1/p')\"")
+         [ -z "$cron" ] && cron=0
+         if [ -z "$path" ] || [ -z "$url" ]; then
+            LOG_WARN "DOWNLOAD FILE no target in【Download Job => file: $file】"
+            download_failed=1
+            break
+         fi
+         need_download=0
+         if [ ! -f "$path" ] || [ "$force" = "true" ]; then
+            need_download=1
+         fi
+         if [ "$need_download" -eq 1 ] && [ -n "$url" ]; then
+            LOG_TIP "DOWNLOAD FILE for【Download Job => file: $file, url: $url, path: $path, ua: ${ua:-null}, force: ${force:-false}】"
+            if command -v curl >/dev/null 2>&1; then
+               if [ -n "$ua" ]; then
+                  DOWNLOAD_FILE_CURL "$url" "$path" "$path" "$ua"
+               else
+                  DOWNLOAD_FILE_CURL "$url" "$path" "$path"
+               fi
+               rc=$?
+            fi
+            if [ $rc -eq 1 ] || [ ! -f "$path" ]; then
+               LOG_ERROR "DOWNLOAD FILE failed for【Download Job => file: $file, url: $url, path: $path】"
+               download_failed=1
+               break
+            fi
+         fi
+         if [ "$cron" != "0" ]; then
+            LOG_TIP "Add Cron for【Cron Job => time: $cron, url: $url, path: $path, restart: ${restart:-false}】"
+            if ! grep -q "$url" $CRON_FILE 2>/dev/null; then
+               if [ -n "$ua" ]; then
+                  cron_cmd="$cron source /usr/share/clashnivo/clashnivo_curl.sh && DOWNLOAD_FILE_CURL \"$url\" \"$path\" \"$path\" \"$ua\""
+               else
+                  cron_cmd="$cron source /usr/share/clashnivo/clashnivo_curl.sh && DOWNLOAD_FILE_CURL \"$url\" \"$path\" \"$path\""
+               fi
+               if [ "$restart" = "1" ] || [ "$restart" = "true" ]; then
+                  cron_cmd="$cron_cmd && [ \"\$?\" -eq 0 ] && /etc/init.d/clashnivo restart"
+               fi
+               cron_cmd="$cron_cmd #clashnivo-overwrite-download"
+               echo "$cron_cmd" >> $CRON_FILE
+            fi
+         fi
+      done
+
+      [ "$download_failed" -eq 1 ] && continue
+
+      in_general=0
+      in_overwrite=0
+      in_yaml=0
+      yaml_content=""
+      while IFS= read -r line || [ -n "$line" ]; do
+         trimmed=$(printf "%s" "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+         case "$trimmed" in
+               "[General]"*) in_general=1; in_overwrite=0; in_yaml=0; continue;;
+               "[Overwrite]"*) in_general=0; in_overwrite=1; in_yaml=0; continue;;
+               "[YAML]"*) in_general=0; in_overwrite=0; in_yaml=1; continue;;
+               "["*"]"*) in_general=0; in_overwrite=0; in_yaml=0; continue;;
+         esac
+         [ -z "$trimmed" ] && continue
+         echo "$trimmed" | grep -qE '^[#;]' && continue
+
+         if [ "$in_general" -eq 1 ]; then
+            key=$(printf "%s" "$trimmed" | awk -F'=' '{gsub(/[[:space:]]+$/,"",$1); print $1}' | sed 's/[[:space:]]*$//;s/ //g')
+            key_u=$(printf "%s" "$key" | tr 'a-z' 'A-Z' | tr -d ' ')
+            if printf "%s" "$key_u" | grep -q "^DOWNLOAD_FILE$"; then
+               continue
+            fi
+            val=$(echo "$trimmed" | sed 's/^[^=]*=[[:space:]]*//')
+            if printf "%s" "$key_u" | grep -q "^CONFIG_FILE$"; then
+               val_clean=$(printf "%s" "$val" | sed "s/^[[:space:]]*['\"]//;s/['\"][[:space:]]*$//")
+               RAW_CONFIG_FILE=$(eval "echo \"$val_clean\"")
+               uci -q set clashnivo.@overwrite[0].config_path="$RAW_CONFIG_FILE"
+               cfg_name=$(basename "$RAW_CONFIG_FILE" 2>/dev/null)
+               if [ -n "$cfg_name" ]; then
+                  CONFIG_FILE="/etc/clashnivo/${cfg_name}"
+                  TMP_CONFIG_FILE="/tmp/yaml_config_tmp_${cfg_name}"
+               fi
+            elif printf "%s" "$key_u" | grep -q "^SUB_INFO_URL$"; then
+               val_clean=$(printf "%s" "$val" | sed "s/^[[:space:]]*['\"]//;s/['\"][[:space:]]*$//")
+               url_key=$(eval "echo \"$val_clean\"")
+               [ -z "$url_key" ] && continue
+               config_load "clashnivo"
+               config_foreach sub_info_set "subscribe_info" "${cfg_name%.*}" "$url_key"
+               if [ "$sub_info_setted" != "1" ]; then
+                  uci -q add clashnivo subscribe_info
+                  uci -q set clashnivo.@subscribe_info[-1].name="${cfg_name%.*}"
+                  uci -q add_list clashnivo.@subscribe_info[-1].url="$url_key"
+               fi
+            elif printf "%s" "$key_u" | grep -q "^RESTART$"; then
+               val_clean=$(printf "%s" "$val" | sed "s/^[[:space:]]*['\"]//;s/['\"][[:space:]]*$//")
+               val_key=$(eval "echo \"$val_clean\"")
+               if printf "%s" "$val_key" | grep -qE '^(1|true|yes)$'; then
+                  eval OVERWRITE_RESTART_FLAG_${name}=1
+               fi
+            else
+               if echo "$allowed_keys_list" | grep -xq "$key_u"; then
+                  key_l=$(printf "%s" "$key_u" | tr 'A-Z' 'a-z' | tr -d ' ')
+                  val_clean=$(printf "%s" "$val" | sed "s/^[[:space:]]*['\"]//;s/['\"][[:space:]]*$//")
+                  val_key=$(eval "echo \"$val_clean\"")
+                  if check_type "$key_u" "$val_clean"; then
+                     uci -q set clashnivo.@overwrite[0]."$key_l"="$val_key"
+                  fi
+               else
+                  LOG_WARN "skip General key not allowed【General Key => $name: $key_u】"
+               fi
+            fi
+         elif [ "$in_overwrite" -eq 1 ]; then
+            if printf "%s" "$trimmed" | grep -qE '^ruby_[a-z_]+\b'; then
+               echo "$trimmed" >> "$overwrite_script"
+               LOG_TIP "Load Overwrite Script【Ruby Script => $trimmed】"
+            else
+               LOG_WARN "skip invalid Overwrite command【Ruby Script => $name: $trimmed】"
+            fi
+         elif [ "$in_yaml" -eq 1 ]; then
+            yaml_content="${yaml_content}$(eval "echo \"$line\"")"$'\n'
+         fi
+      done < "$file"
+
+      if [ -n "$yaml_content" ]; then
+         LOG_TIP "Load YAML Override Block【YAML Block => $name】"
+
+         cat >> "$overwrite_script" <<'EOF'
+ruby -ryaml -rYAML -I "/usr/share/clashnivo" -E UTF-8 -e "
+   begin
+      yaml_override_content = <<-'YAML_CONTENT'
+EOF
+
+         echo "$yaml_content" >> "$overwrite_script"
+
+         cat >> "$overwrite_script" <<'EOF'
+      YAML_CONTENT
+
+      begin
+         yaml_data = YAML.load(yaml_override_content)
+
+         if yaml_data.is_a?(Hash)
+            Value = YAML.load_file('$CONFIG_FILE')
+            Overwrite_Value = YAML.overwrite(Value, yaml_data)
+            File.open('$CONFIG_FILE', 'w') do |f|
+               YAML.dump(Overwrite_Value, f)
+            end
+         else
+            YAML.LOG_WARN('Invalid YAML Override format, skipped...')
+         end
+      rescue => e
+         YAML.LOG_ERROR('Parse YAML Override failed:【%s】' % [e.message])
+      end
+   rescue => e
+      YAML.LOG_ERROR('Parse YAML Override failed:【%s】' % [e.message])
+   end
+" >> $LOG_FILE 2>&1
+EOF
+      fi
+
+      cat >> "$overwrite_script" <<'EOF'
+if [ -f "/tmp/yaml_clashnivo_ruby_parts/$CLASHNIVO_OVERWRITE_SID" ]; then
+   ruby_code=$(cat "/tmp/yaml_clashnivo_ruby_parts/$CLASHNIVO_OVERWRITE_SID")
+   ruby -ryaml -rYAML -I "/usr/share/clashnivo" -E UTF-8 -e "
+      Value = YAML.load_file('$CONFIG_FILE')
+      threads = []
+      $ruby_code
+      threads.each(&:join)
+      File.open('$CONFIG_FILE', 'w') do |f|
+         YAML.dump(Value, f)
+      end
+   " >> $LOG_FILE 2>&1
+fi
+EOF
+
+      echo "" >> "$overwrite_script"
+   done
+
+   if [ -n "$(uci -q show clashnivo.@overwrite[0] | grep -v '=overwrite$')" ]; then
+      eval "$(uci -q show clashnivo.@overwrite[0] | grep -v '=overwrite$' | sed 's/^clashnivo\.@overwrite\[0\]\.//g' | sed 's/=/="/;s/$/"/')"
+      while IFS='=' read -r key value; do
+         [ -z "$key" ] && continue
+         key_clean=$(echo "$key" | sed 's/^clashnivo\.[^.]*\.//')
+         value_clean=$(echo "$value" | sed "s/^'//;s/'$//")
+         [ -z "$key_clean" ] && continue
+         LOG_TIP "Load Overwrite Script【$key_clean => '$value_clean'】"
+      done <<EOF
+$(uci -q show clashnivo.@overwrite[0] | grep -v '=overwrite$' | sed 's/^clashnivo\.@overwrite\[0\]\.//g')
+EOF
+   else
+      clear_overwrite_set
+   fi
+}
+
+clear_overwrite_set()
+{
+   uci -q delete clashnivo.@overwrite[0]
+   uci -q commit clashnivo
+}
+
+get_config()
+{
+   RAW_CONFIG_FILE=$(uci_get_config "config_path")
+   CFG_NAME=$(basename "$RAW_CONFIG_FILE" 2>/dev/null)
+   CONFIG_FILE="/etc/clashnivo/${CFG_NAME}"
+   TMP_CONFIG_FILE="/tmp/yaml_config_tmp_${CFG_NAME}"
+   enable=$(uci_get_config "enable")
+   enable_custom_clash_rules=$(uci_get_config "enable_custom_clash_rules")
+   da_password=$(uci_get_config "dashboard_password")
+   cn_port=$(uci_get_config "cn_port")
+   proxy_port=$(uci_get_config "proxy_port")
+   tproxy_port=$(uci_get_config "tproxy_port" || echo 7995)
+   proxy_mode=$(uci_get_config "proxy_mode")
+   http_port=$(uci_get_config "http_port")
+   socks_port=$(uci_get_config "socks_port")
+   enable_redirect_dns=$(uci_get_config "enable_redirect_dns" || echo 1)
+   if [ "$(uci_get_config "fakeip_range")"  == "0" ]; then
+      fakeip_range=$(ruby_read "$RAW_CONFIG_FILE" "['dns']['fake-ip-range']")
+   else
+      fakeip_range=$(uci_get_config "fakeip_range")
+   fi
+   [ -z "$fakeip_range" ] && fakeip_range="198.18.0.1/16"
+
+   lan_interface_name=$(uci_get_config "lan_interface_name" || echo 0)
+   if [ "$lan_interface_name" = "0" ]; then
+      lan_ip=$(uci -q get network.lan.ipaddr 2>/dev/null | awk -F '/' '{print $1}' 2>/dev/null | tr -d '\n' || ip address show $(uci -q -p /tmp/state get network.lan.ifname || uci -q -p /tmp/state get network.lan.device) | grep -w "inet" 2>/dev/null |grep -Eo 'inet [0-9\.]+' | awk '{print $2}' | head -1 | tr -d '\n' || ip addr show 2>/dev/null | grep -w 'inet' | grep 'global' | grep 'brd' | grep -Eo 'inet [0-9\.]+' | awk '{print $2}' | head -n 1 | tr -d '\n')
+   else
+      lan_ip=$(ip address show $lan_interface_name 2>/dev/null | grep -w "inet" 2>/dev/null | grep -Eo 'inet [0-9\.]+' | awk '{print $2}' | head -1 | tr -d '\n')
+   fi
+
+   wan_ip4s=$(/usr/share/clashnivo/clashnivo_get_network.lua "wanip" 2>/dev/null)
+   log_level=$(uci_get_config "log_level")
+   intranet_allowed=$(uci_get_config "intranet_allowed")
+   enable_udp_proxy=$(uci_get_config "enable_udp_proxy" || echo 1)
+   disable_udp_quic=$(uci_get_config "disable_udp_quic")
+   lan_ac_mode=$(uci_get_config "lan_ac_mode")
+   enable_rule_proxy=$(uci_get_config "enable_rule_proxy")
+   stack_type=$(uci_get_config "stack_type")
+   small_flash_memory=$(uci_get_config "small_flash_memory")
+   mixed_port=$(uci_get_config "mixed_port")
+   interface_name=$(uci_get_config "interface_name" || echo 0)
+   common_ports=$(uci_get_config "common_ports")
+   dns_port=$(uci_get_config "dns_port")
+   store_fakeip=$(uci_get_config "store_fakeip" || echo 0)
+   bypass_gateway_compatible=$(uci_get_config "bypass_gateway_compatible" || echo 0)
+   core_version=$(uci_get_config "core_version" || echo 0)
+   router_self_proxy=$(uci_get_config "router_self_proxy" || echo 1)
+   enable_meta_sniffer=$(uci_get_config "enable_meta_sniffer" || echo 0)
+   enable_meta_sniffer_custom=$(uci_get_config "enable_meta_sniffer_custom" || echo 0)
+   geodata_loader=$(uci_get_config "geodata_loader" || echo 0)
+   enable_geoip_dat=$(uci_get_config "enable_geoip_dat" || echo 0)
+   enable_tcp_concurrent=$(uci_get_config "enable_tcp_concurrent" || echo 0)
+   append_default_dns=$(uci_get_config "append_default_dns" || echo 0)
+   enable_meta_sniffer_pure_ip=$(uci_get_config "enable_meta_sniffer_pure_ip" || echo 0)
+   find_process_mode=$(uci_get_config "find_process_mode" || echo 0)
+   upnp_lease_file=$(uci -q get upnpd.config.upnp_lease_file)
+   enable_unified_delay=$(uci_get_config "enable_unified_delay" || echo 0)
+   enable_respect_rules=$(uci_get_config "enable_respect_rules" || echo 0)
+   intranet_allowed_wan_name=$(uci_get_config "intranet_allowed_wan_name" || echo 0)
+   custom_fakeip_filter_mode=$(uci_get_config "custom_fakeip_filter_mode" || echo "blacklist")
+   iptables_compat=$(iptables -m owner -h 2>/dev/null | grep "owner match options" || command -v fw4 || echo 0)
+   disable_quic_go_gso=$(uci_get_config "disable_quic_go_gso" || echo 0)
+   cors_allow=$(uci_get_config "dashboard_forward_domain" || echo 0)
+   geo_custom_url=$(uci_get_config "geo_custom_url" || echo 0)
+   geoip_custom_url=$(uci_get_config "geoip_custom_url" || echo 0)
+   geosite_custom_url=$(uci_get_config "geosite_custom_url" || echo 0)
+   geoasn_custom_url=$(uci_get_config "geoasn_custom_url" || echo 0)
+
+   [ -z "$dns_port" ] && dns_port=7974 && uci -q set clashnivo.config.dns_port=7974
+   uci -q commit clashnivo
+}
+
+start_service()
+{
+   enable=$(uci_get_config "enable")
+   [ "$enable" != "1" ] && LOG_WARN "Clash Nivo Now Disabled, Need Start From Luci Page, Exit..." && SLOG_CLEAN && exit 0
+
+   if procd_running "clashnivo" >/dev/null; then
+      LOG_TIP "Clash Nivo Already Running, Exit..."
+      exit 0
+   fi
+
+   LOG_TIP "Clash Nivo Start Running..."
+
+   {
+      LOG_OUT "Step 1: Get The Configuration..."
+      check_run_quick
+      overwrite_file
+      get_config
+      config_choose
+      do_run_mode
+
+      LOG_OUT "Step 2: Check The Components..."
+      do_run_file "$RAW_CONFIG_FILE"
+
+      if ! $QUICK_START; then
+         LOG_OUT "Step 3: Modify The Config File..."
+         config_check
+         /usr/share/clashnivo/clashnivo_yml_change.sh \
+         "$en_mode" "$da_password" "$cn_port" "$proxy_port" "$TMP_CONFIG_FILE" \
+         "$http_port" "$socks_port" "$log_level" "$proxy_mode" \
+         "$dns_port" "$mixed_port" "$tproxy_port" \
+         "$store_fakeip" "$enable_meta_sniffer" "$enable_geoip_dat" "$geodata_loader" "$enable_meta_sniffer_custom" \
+         "$interface_name" "$enable_tcp_concurrent" "$append_default_dns" "$enable_meta_sniffer_pure_ip" \
+         "$find_process_mode" "$fakeip_range" "$enable_unified_delay" \
+         "$enable_respect_rules" "$custom_fakeip_filter_mode" "$iptables_compat" "$disable_quic_go_gso" "$cors_allow" \
+         "$geo_custom_url" "$geoip_custom_url" "$geosite_custom_url" "$geoasn_custom_url"
+
+         /usr/share/clashnivo/clashnivo_yml_rules_change.sh \
+         "$enable_custom_clash_rules" "$TMP_CONFIG_FILE" \
+         "$enable_rule_proxy" "$router_self_proxy" "$lan_ip" "$enable_redirect_dns" "$en_mode"
+
+         if [ -f "/tmp/yaml_overwrite.sh" ]; then
+            chmod +x /tmp/yaml_overwrite.sh
+            CONFIG_FILE="${TMP_CONFIG_FILE}" /tmp/yaml_overwrite.sh
+            rm -rf /tmp/yaml_clashnivo_ruby_parts
+         fi
+
+         if [ -f "/etc/clashnivo/custom/clashnivo_custom_overwrite.sh" ]; then
+            chmod +x /etc/clashnivo/custom/clashnivo_custom_overwrite.sh
+            /etc/clashnivo/custom/clashnivo_custom_overwrite.sh "$TMP_CONFIG_FILE"
+            if [ -f "/tmp/yaml_clashnivo_ruby_parse" ]; then
+               sed -n "s/.*yaml_file_path=['\"]\([^'\"]*\)['\"].*/\1/p" /tmp/yaml_clashnivo_ruby_parse | sort | uniq | while read -r yaml_file; do
+                  [ -z "$yaml_file" ] && continue
+                  ruby_code=$(grep "yaml_file_path=['\"]$yaml_file['\"]" /tmp/yaml_clashnivo_ruby_parse | sed "s/^threads << Thread.new do //;s/ end$//")
+                  [ -z "$ruby_code" ] && continue
+                  if [ -f "$yaml_file" ]; then
+                     (
+                        ruby -ryaml -rYAML -I "/usr/share/clashnivo" -E UTF-8 -e "
+                        Value = YAML.load_file('$yaml_file');
+                        threads = []
+                        $ruby_code
+                        threads.each(&:join)
+                        File.open('$yaml_file', 'w') do |f|
+                           YAML.dump(Value, f)
+                        end
+                        " >> $LOG_FILE 2>&1
+                     )
+                  fi
+               done
+            fi
+         fi
+      else
+         LOG_OUT "Step 3: Quick Start Mode, Skip Modify The Config File..."
+      fi
+
+      LOG_OUT "Step 4: Start Running The Mihomo Core..."
+      start_run_core
+
+      LOG_OUT "Step 5: Add Cron Rules, Start Daemons..."
+      add_cron
+
+      LOG_OUT "Step 6: Core Status Checking and Firewall Rules Setting..."
+      check_core_status "start" &
+
+      rm -rf /tmp/yaml_*
+   } >/dev/null 2>&1
+
+   echo "Clash Nivo Already Start!"
+}
+
+stop_service()
+{
+   get_config
+
+   LOG_TIP "Clash Nivo Stoping..."
+
+   {
+      LOG_OUT "Step 1: Delete Clash Nivo Firewall Rules..."
+      revert_firewall
+
+      LOG_OUT "Step 2: Close The Clash Nivo Services..."
+      procd_kill "clashnivo"
+      for i in $(seq 1 10); do
+         procd_running "clashnivo" >/dev/null && sleep 1 || break
+      done
+      if procd_running "clashnivo" >/dev/null; then
+         kill -9 $(pidof mihomo) 2>/dev/null || true
+      fi
+
+      LOG_OUT "Step 3: Restart Dnsmasq..."
+      revert_dnsmasq
+
+      LOG_OUT "Step 4: Delete Clash Nivo Residue File..."
+      LOG_TIP "Clash Nivo Already Stop!"
+
+      if [ "$enable" != "1" ]; then
+         rm -rf /tmp/mihomo_last_version \
+                /tmp/clashnivo_last_version \
+                /tmp/clashnivo.change \
+                /tmp/clashnivo_announcement \
+                ${DNSMASQ_CONF_DIR}/dnsmasq_clashnivo_custom_domain.conf
+         SLOG_CLEAN
+      fi
+
+      del_cron
+      clear_overwrite_set
+      rm -rf /tmp/clashnivo_jobs
+      rm -rf /tmp/yaml_*
+   } >/dev/null 2>&1
+
+   echo "Clash Nivo Already Stop!"
+}
+
+revert_dnsmasq()
+{
+   redirect_dns=$(uci_get_config "redirect_dns")
+   dnsmasq_server=$(uci_get_config "dnsmasq_server")
+   dnsmasq_noresolv=$(uci_get_config "dnsmasq_noresolv")
+   dnsmasq_resolvfile=$(uci_get_config "dnsmasq_resolvfile")
+   cachesize_dns=$(uci_get_config "cachesize_dns")
+   dnsmasq_cachesize=$(uci_get_config "dnsmasq_cachesize")
+   default_resolvfile=$(uci_get_config "default_resolvfile")
+   revert_dns "$redirect_dns" "$enable" "$default_resolvfile" "$dnsmasq_noresolv" "$dnsmasq_resolvfile" "$cachesize_dns" "$dnsmasq_cachesize" "0" "" "$dnsmasq_server"
+} >/dev/null 2>&1
+
+restart()
+{
+   echo "Clash Nivo Restart..."
+   LOG_TIP "Clash Nivo Restart..."
+   check_run_quick
+   stop_service
+   start
+}
+
+start_watchdog()
+{
+   procd_open_instance "clashnivo-watchdog"
+   procd_set_param command "/usr/share/clashnivo/clashnivo_watchdog.sh"
+   procd_close_instance
+}
+
+reload_service()
+{
+   get_config
+   MAX_RELOAD=10
+   if pidof mihomo >/dev/null && [ "$enable" == "1" ] && [ "$1" == "firewall" ]; then
+      sleep 5
+      NOW_TS=$(date +%s)
+      LAST_LINE=$(grep "Reload Clash Nivo Firewall Rules...$" "$LOG_FILE" | tail -n 1)
+      LAST_TIME=$(echo "$LAST_LINE" | awk '{print $1" "$2}')
+      LAST_TS=$(date -d "$LAST_TIME" +%s 2>/dev/null)
+      CUR_RELOAD_NUM=$(echo "$LAST_LINE" | grep -oE '【[0-9]+/' | grep -oE '[0-9]+')
+      if [ -n "$LAST_TS" ] && [ $((NOW_TS - LAST_TS)) -gt 300 ]; then
+         CUR_RELOAD_NUM=0
+      fi
+      [ -z "$CUR_RELOAD_NUM" ] && CUR_RELOAD_NUM=0
+      CUR_RELOAD_NUM=$((CUR_RELOAD_NUM+1))
+      [ "$CUR_RELOAD_NUM" -gt "$MAX_RELOAD" ] && CUR_RELOAD_NUM=$MAX_RELOAD
+      RELOAD_COUNT=$(grep "Reload Clash Nivo Firewall Rules...$" "$LOG_FILE" | awk '{print $1" "$2}' | while read t; do
+         TS=$(date -d "$t" +%s 2>/dev/null)
+         [ -n "$TS" ] && [ $((NOW_TS - TS)) -le 300 ] && echo 1
+      done | wc -l)
+      if [ "$RELOAD_COUNT" -ge "$MAX_RELOAD" ]; then
+         LOG_OUT "【${CUR_RELOAD_NUM}/$MAX_RELOAD】Skip Reload Clash Nivo Firewall Rules Until 5 Minutes Later..."
+         exit 0
+      fi
+      LOG_OUT "【${CUR_RELOAD_NUM}/$MAX_RELOAD】Reload Clash Nivo Firewall Rules..."
+      revert_firewall
+      do_run_mode
+      check_core_status &
+   fi
+   if pidof mihomo >/dev/null && [ "$enable" == "1" ] && [ "$1" == "manual" ]; then
+      LOG_OUT "Manually Reload Firewall Rules..."
+      revert_firewall
+      do_run_mode
+      check_core_status &
+   fi
+   if pidof mihomo >/dev/null && [ "$enable" == "1" ] && [ "$1" == "revert" ]; then
+      revert_firewall
+      revert_dnsmasq
+      SLOG_CLEAN
+   fi
+   if pidof mihomo >/dev/null && [ "$enable" == "1" ] && [ "$1" == "restore" ]; then
+      do_run_mode
+      check_core_status
+   fi
+} >/dev/null 2>&1
+
+boot()
+{
+   delay_start=$(uci_get_config "delay_start" || echo 0)
+   enable=$(uci_get_config "enable")
+   if [ "$delay_start" -gt 0 ] && [ "$enable" == "1" ]; then
+      LOG_OUT "Enable Delay Start, Clash Nivo Will Start After【$delay_start】Seconds..."
+      sleep "$delay_start"
+   fi
+   start
+}

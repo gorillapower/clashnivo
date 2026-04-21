@@ -1,0 +1,138 @@
+
+config clashnivo 'config'
+
+	# §1.1 Identity & lifecycle
+	option enable '0'
+	option delay_start '0'
+	option operation_mode 'fake-ip'
+	option proxy_mode 'rule'
+	option log_level 'info'
+	option log_size '1024'
+
+	# §1.2 Ports (+100 from OpenClash to allow side-by-side coexistence)
+	option http_port '7990'
+	option socks_port '7991'
+	option proxy_port '7992'
+	option mixed_port '7993'
+	option tproxy_port '7995'
+	option dns_port '7974'
+	option cn_port '9190'
+	option common_ports '0'
+
+	# §1.3 DNS
+	option enable_redirect_dns '1'
+	option fakeip_range '198.18.0.0/15'
+	option store_fakeip '0'
+	option enable_custom_dns '0'
+	option custom_fakeip_filter '0'
+	option custom_fakeip_filter_mode 'blacklist'
+	option custom_fallback_filter '0'
+	option custom_host '0'
+	option custom_name_policy '0'
+	option custom_proxy_server_policy '0'
+	option append_default_dns '0'
+	option append_wan_dns '0'
+	option enable_custom_domain_dns_server '0'
+	option custom_domain_dns_server '8.8.8.8'
+	option disable_masq_cache '1'
+
+	# §1.4 Transparent proxying
+	option enable_udp_proxy '1'
+	option disable_udp_quic '1'
+	option intranet_allowed '1'
+	option enable_rule_proxy '0'
+	option router_self_proxy '1'
+	option bypass_gateway_compatible '0'
+	option small_flash_memory '0'
+	option disable_quic_go_gso '0'
+
+	# §1.5 LAN access control
+	option lan_ac_mode '0'
+	option lan_interface_name '0'
+	option interface_name '0'
+
+	# §1.6 Mihomo feature flags
+	option enable_tcp_concurrent '0'
+	option enable_unified_delay '0'
+	option enable_respect_rules '0'
+	option enable_meta_sniffer '0'
+	option enable_meta_sniffer_custom '0'
+	option enable_meta_sniffer_pure_ip '0'
+	option find_process_mode '0'
+
+	# §1.7 Binary & dashboard
+	# dashboard_password and core_version are set by uci-defaults/luci-clashnivo at first boot
+	option dashboard_type 'zashboard'
+	option dashboard_forward_domain '0'
+	option dashboard_forward_ssl '0'
+	option enable_custom_clash_rules '0'
+
+	# §1.8 URL-test & CDN rewrite
+	option github_address_mod '0'
+	option urltest_address_mod '0'
+	option urltest_interval_mod '0'
+	option tolerance '0'
+
+	# §1.9 GEO data
+	option geo_custom_url 'https://testingcf.jsdelivr.net/gh/alecthw/mmdb_china_ip_list@release/lite/Country.mmdb'
+	option geoip_custom_url 'https://testingcf.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geoip.dat'
+	option geosite_custom_url 'https://testingcf.jsdelivr.net/gh/Loyalsoldier/v2ray-rules-dat@release/geosite.dat'
+	option geoasn_custom_url 'https://testingcf.jsdelivr.net/gh/xishang0128/geoip@release/GeoLite2-ASN.mmdb'
+	option geodata_loader '0'
+	option enable_geoip_dat '0'
+	option geo_auto_update '0'
+	option geoip_auto_update '0'
+	option geosite_auto_update '0'
+	option geoasn_auto_update '0'
+
+	# §1.10 Auto-update & auto-restart
+	option auto_update '0'
+	option auto_update_time '0'
+	option config_auto_update_mode '0'
+	option config_update_week_time '0'
+	option config_update_interval '60'
+	option auto_restart '0'
+
+# §5 DNS upstreams — international defaults for an English-first deployment
+
+config dns_servers
+	option enabled '1'
+	option group 'nameserver'
+	option type 'udp'
+	option ip '8.8.8.8'
+
+config dns_servers
+	option enabled '1'
+	option group 'nameserver'
+	option type 'udp'
+	option ip '1.1.1.1'
+
+config dns_servers
+	option enabled '1'
+	option group 'nameserver'
+	option type 'https'
+	option ip 'dns.google/dns-query'
+
+config dns_servers
+	option enabled '1'
+	option group 'nameserver'
+	option type 'https'
+	option ip 'cloudflare-dns.com/dns-query'
+
+config dns_servers
+	option enabled '1'
+	option group 'fallback'
+	option type 'udp'
+	option ip '9.9.9.9'
+
+config dns_servers
+	option enabled '1'
+	option group 'fallback'
+	option type 'udp'
+	option ip '149.112.112.112'
+
+config dns_servers
+	option enabled '0'
+	option group 'fallback'
+	option type 'https'
+	option ip 'dns.quad9.net/dns-query'

@@ -1,0 +1,114 @@
+<%+cbi/valueheader%>
+<%#
+Subscription quota widget. Renders a progress bar with used / total traffic
+plus expiry days remaining, fetched from the subscription-userinfo HTTP
+header at /admin/services/clashnivo/sub_info_get.
+
+Simplified vs OpenClash:
+  - Single provider only (no multi-provider carousel).
+  - No "specify sub-info URL" override modal — subscription.address is used.
+%>
+<style>
+.cn-sub-wrap { display: flex; align-items: center; gap: 8px; min-width: 240px; max-width: 360px; }
+.cn-sub-bar { flex: 1; position: relative; height: 34px; border: 1px solid #999; border-radius: 6px; background: #f5f5f5; overflow: hidden; box-sizing: border-box; }
+.cn-sub-fill { position: absolute; left: 0; top: 0; bottom: 0; height: 100%; border-radius: 5px; transition: width 0.3s ease; }
+.cn-sub-fill.high   { background: #9edd9e; }
+.cn-sub-fill.med    { background: #ffc99f; }
+.cn-sub-fill.low    { background: #ffb9b9; }
+.cn-sub-text { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; font-size: 11px; color: #333; line-height: 1.2; padding: 0 6px; text-align: center; }
+.cn-sub-refresh { background: unset; border: unset; cursor: pointer; padding: 2px; }
+.cn-sub-refresh svg { width: 18px; height: 18px; color: #414c5c; vertical-align: middle; }
+.cn-sub-refresh:hover svg { opacity: 0.7; }
+:root[data-darkmode="true"] .cn-sub-bar { background: #333; border-color: #666; }
+:root[data-darkmode="true"] .cn-sub-text { color: #e0e0e0; }
+:root[data-darkmode="true"] .cn-sub-refresh svg { color: #e0e0e0; }
+</style>
+
+<%
+	local fs = require "luci.clashnivo"
+	local filename = fs.filename(self:cfgvalue(section)) or ""
+	local idname = math.random(1000) .. (string.match(filename, "[%w_]+") or "")
+%>
+
+<div class="cn-sub-wrap">
+	<div class="cn-sub-bar" id="cn_sub_<%=idname%>">
+		<div class="cn-sub-text"><%:Loading...%></div>
+	</div>
+	<button type="button" class="cn-sub-refresh" title="<%:Refresh%>" onclick="return cn_sub_refresh_<%=idname%>(true)">
+		<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+			<path d="M23 4v6h-6"></path>
+			<path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path>
+		</svg>
+	</button>
+</div>
+
+<script type="text/javascript">//<![CDATA[
+(function() {
+	var url = '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "sub_info_get")%>';
+	var filename = '<%=filename%>';
+	var cacheKey = 'cn_sub_info_' + filename;
+	var retry = 0;
+	var timer;
+
+	function render(data) {
+		var bar = document.getElementById('cn_sub_<%=idname%>');
+		if (!bar) return;
+		if (!data || !data.providers || data.providers.length === 0) {
+			bar.innerHTML = '<div class="cn-sub-text"><%:No Info%></div>';
+			return;
+		}
+		var p = data.providers[0];
+		var pct = parseFloat(p.percent) || 0;
+		var cls = pct >= 50 ? 'high' : (pct >= 20 ? 'med' : 'low');
+		var surplus = p.surplus || p.used || '0';
+		var total = p.total || 'N/A';
+		var expire = p.expire;
+		var days = p.day_left;
+		var summary = surplus + ' / ' + total + ' (' + pct + '%)';
+		var line2 = '';
+		if (expire && expire !== 'null') {
+			line2 = expire + (days && days !== 'null' ? ' (<%:Remaining%> ' + days + ' <%:days%>)' : '');
+		}
+		bar.innerHTML =
+			'<div class="cn-sub-fill ' + cls + '" style="width:' + pct + '%"></div>' +
+			'<div class="cn-sub-text"><span>' + summary + '</span>' +
+			(line2 ? '<span>' + line2 + '</span>' : '') + '</div>';
+	}
+
+	window.cn_sub_refresh_<%=idname%> = function(force) {
+		if (timer) clearTimeout(timer);
+		if (force) localStorage.removeItem(cacheKey);
+		var cached = localStorage.getItem(cacheKey);
+		var now = Math.floor(Date.now() / 1000);
+		if (!force && cached) {
+			try {
+				var obj = JSON.parse(cached);
+				render(obj);
+				if (obj.get_time && (now - obj.get_time) < 1800) {
+					timer = setTimeout(function() { cn_sub_refresh_<%=idname%>(false); }, 15 * 60 * 1000);
+					return false;
+				}
+			} catch(e) {}
+		}
+		XHR.get(url, { filename: filename }, function(x, status) {
+			if (x && x.status === 200 && status && status.providers) {
+				retry = 0;
+				localStorage.setItem(cacheKey, JSON.stringify(status));
+				render(status);
+				timer = setTimeout(function() { cn_sub_refresh_<%=idname%>(false); }, 15 * 60 * 1000);
+			} else if (retry < 2) {
+				retry++;
+				timer = setTimeout(function() { cn_sub_refresh_<%=idname%>(false); }, 5000);
+			} else {
+				retry = 0;
+				render(null);
+				timer = setTimeout(function() { cn_sub_refresh_<%=idname%>(false); }, 15 * 60 * 1000);
+			}
+		});
+		return false;
+	};
+
+	cn_sub_refresh_<%=idname%>(false);
+})();
+//]]></script>
+<%+cbi/valuefooter%>

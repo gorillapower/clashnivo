@@ -1,0 +1,220 @@
+<%#
+Overview status widget for Clash Nivo.
+
+Fresh Epic 1 implementation — not forked from OpenClash's status.htm (that
+file is 5982 LOC mixing streaming unlock, core download, dashboard swap,
+and MYIP checks, none of which are in Epic 1 scope).
+
+The view polls three endpoints on a 5s timer:
+  - status: running/stopped + dashboard location
+  - op_mode + rule_mode + log_level: current core state
+
+All switch_* endpoints PATCH the running core via REST when available and
+persist the choice to UCI. Start/stop just reloads the page to let the
+underlying form submit drive init.d.
+%>
+
+<style>
+.cn-card {
+	background: var(--background);
+	border: 1px solid var(--border-color-low, #ccc);
+	border-radius: 6px;
+	padding: 12px 16px;
+	margin-bottom: 12px;
+}
+.cn-card h3 {
+	margin: 0 0 8px 0;
+	font-size: 14px;
+	font-weight: 600;
+	color: var(--text-color-high, #333);
+}
+.cn-row {
+	display: flex;
+	align-items: center;
+	gap: 12px;
+	margin: 6px 0;
+	flex-wrap: wrap;
+}
+.cn-label { min-width: 140px; color: var(--text-color-mid, #666); }
+.cn-value { font-weight: 600; }
+.cn-running { color: #059669; }
+.cn-stopped { color: #dc2626; }
+.cn-btn {
+	padding: 4px 12px;
+	border: 1px solid var(--border-color-low, #ccc);
+	background: var(--background);
+	color: var(--text-color-high, #333);
+	border-radius: 4px;
+	cursor: pointer;
+	font-size: 13px;
+}
+.cn-btn:hover { background: var(--background-low, #f5f5f5); }
+.cn-btn:disabled { opacity: 0.5; cursor: wait; }
+.cn-btn-primary { background: #3b82f6; color: #fff; border-color: #3b82f6; }
+.cn-btn-primary:hover { background: #2563eb; }
+.cn-btn-danger { background: #dc2626; color: #fff; border-color: #dc2626; }
+.cn-btn-danger:hover { background: #b91c1c; }
+.cn-select {
+	padding: 4px 8px;
+	border: 1px solid var(--border-color-low, #ccc);
+	border-radius: 4px;
+	background: var(--background);
+	color: var(--text-color-high, #333);
+}
+.cn-link {
+	color: #3b82f6;
+	text-decoration: none;
+}
+.cn-link:hover { text-decoration: underline; }
+.cn-muted { color: var(--text-color-mid, #888); font-size: 12px; }
+</style>
+
+<div id="cn-overview">
+	<div class="cn-card">
+		<h3><%:Service Status%></h3>
+		<div class="cn-row">
+			<span class="cn-label"><%:Core%>:</span>
+			<span class="cn-value" id="cn-status-text">—</span>
+			<button type="button" class="cn-btn cn-btn-primary" id="cn-start-btn"   onclick="cnServiceToggle('start')"><%:Start%></button>
+			<button type="button" class="cn-btn cn-btn-danger"  id="cn-stop-btn"    onclick="cnServiceToggle('stop')"><%:Stop%></button>
+			<button type="button" class="cn-btn"                id="cn-restart-btn" onclick="cnServiceToggle('restart')"><%:Restart%></button>
+		</div>
+		<div class="cn-row">
+			<span class="cn-label"><%:Dashboard%>:</span>
+			<span id="cn-dashboard-link">—</span>
+		</div>
+		<div class="cn-row">
+			<span class="cn-label"><%:API Secret%>:</span>
+			<code id="cn-dashboard-pwd">—</code>
+		</div>
+	</div>
+
+	<div class="cn-card">
+		<h3><%:Quick Switches%></h3>
+		<div class="cn-row">
+			<span class="cn-label"><%:Operation Mode%>:</span>
+			<select class="cn-select" id="cn-op-mode" onchange="cnSwitchOpMode(this)">
+				<option value="fake-ip">fake-ip</option>
+				<option value="redir-host">redir-host</option>
+			</select>
+			<span class="cn-muted"><%:Requires restart to take effect%></span>
+		</div>
+		<div class="cn-row">
+			<span class="cn-label"><%:Proxy Mode%>:</span>
+			<select class="cn-select" id="cn-rule-mode" onchange="cnSwitchRuleMode(this)">
+				<option value="rule"><%:Rule%></option>
+				<option value="global"><%:Global%></option>
+				<option value="direct"><%:Direct%></option>
+			</select>
+		</div>
+		<div class="cn-row">
+			<span class="cn-label"><%:Log Level%>:</span>
+			<select class="cn-select" id="cn-log-level" onchange="cnSwitchLogLevel(this)">
+				<option value="silent">silent</option>
+				<option value="error">error</option>
+				<option value="warning">warning</option>
+				<option value="info">info</option>
+				<option value="debug">debug</option>
+			</select>
+		</div>
+	</div>
+</div>
+
+<script type="text/javascript">//<![CDATA[
+(function() {
+	var urls = {
+		status:           '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "status")%>',
+		service_toggle:   '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "service_toggle")%>',
+		op_mode:          '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "op_mode")%>',
+		switch_mode:      '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "switch_mode")%>',
+		rule_mode:        '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "rule_mode")%>',
+		switch_rule_mode: '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "switch_rule_mode")%>',
+		log_level:        '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "log_level")%>',
+		switch_log:       '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "switch_log")%>'
+	};
+
+	function fmtDashboardUrl(s) {
+		if (!s || !s.daip || !s.cn_port) return null;
+		var scheme = s.db_forward_ssl == 1 ? 'https' : 'http';
+		var host   = s.db_foward_domain && s.db_foward_domain !== '0' ? s.db_foward_domain : s.daip;
+		return scheme + '://' + host + ':' + s.cn_port + '/ui/' + (s.dashboard_type || 'zashboard') + '/';
+	}
+
+	function renderStatus(s) {
+		var statusEl = document.getElementById('cn-status-text');
+		var startBtn = document.getElementById('cn-start-btn');
+		var stopBtn  = document.getElementById('cn-stop-btn');
+		var linkEl   = document.getElementById('cn-dashboard-link');
+		var pwdEl    = document.getElementById('cn-dashboard-pwd');
+
+		if (s.running) {
+			statusEl.textContent = '<%:Running%>';
+			statusEl.className   = 'cn-value cn-running';
+		} else {
+			statusEl.textContent = '<%:Stopped%>';
+			statusEl.className   = 'cn-value cn-stopped';
+		}
+
+		startBtn.disabled = !!s.running;
+		stopBtn.disabled  = !s.running;
+
+		var url = fmtDashboardUrl(s);
+		if (url) {
+			linkEl.innerHTML = '<a class="cn-link" href="' + url + '" target="_blank" rel="noopener">' + url + '</a>';
+		} else {
+			linkEl.textContent = '<%:Unavailable until core is running%>';
+		}
+		pwdEl.textContent = s.dase || '—';
+	}
+
+	function poll() {
+		XHR.get(urls.status, null, function(x, data) {
+			if (x && x.status === 200 && data) renderStatus(data);
+		});
+		XHR.get(urls.op_mode, null, function(x, data) {
+			if (x && x.status === 200 && data && data.op_mode) {
+				document.getElementById('cn-op-mode').value = data.op_mode;
+			}
+		});
+		XHR.get(urls.rule_mode, null, function(x, data) {
+			if (x && x.status === 200 && data && data.mode) {
+				document.getElementById('cn-rule-mode').value = data.mode;
+			}
+		});
+		XHR.get(urls.log_level, null, function(x, data) {
+			if (x && x.status === 200 && data && data.log_level) {
+				document.getElementById('cn-log-level').value = data.log_level;
+			}
+		});
+	}
+
+	window.cnSwitchOpMode = function(sel) {
+		XHR.get(urls.switch_mode, { mode: sel.value }, function(x, data) {
+			if (data && data.restart_required) {
+				// operation_mode changes the firewall rule shape; core must reboot.
+				document.getElementById('cn-status-text').textContent = '<%:Restarting…%>';
+			}
+			poll();
+		});
+	};
+
+	window.cnSwitchRuleMode = function(sel) {
+		XHR.get(urls.switch_rule_mode, { rule_mode: sel.value }, function() { poll(); });
+	};
+
+	window.cnSwitchLogLevel = function(sel) {
+		XHR.get(urls.switch_log, { log_level: sel.value }, function() { poll(); });
+	};
+
+	window.cnServiceToggle = function(action) {
+		var btn = document.getElementById('cn-' + (action === 'restart' ? 'restart' : action) + '-btn');
+		if (btn) btn.disabled = true;
+		XHR.get(urls.service_toggle, { action: action }, function() {
+			setTimeout(poll, 1500);
+		});
+	};
+
+	poll();
+	setInterval(poll, 5000);
+})();
+//]]></script>

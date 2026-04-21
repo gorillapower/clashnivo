@@ -1,0 +1,105 @@
+<%#
+Bottom toolbar: subscription/config file switcher.
+
+Epic 1 ships this in the keep-and-hide pattern. The shell renders hidden;
+on every page load it polls the `config_name` endpoint. Epic 2 will
+populate /etc/clashnivo/config/ with real subscription files and the
+dropdown will surface; until then the `else` branch hides the element.
+%>
+
+<style>
+.cn-toolbar-label {
+	display: inline-block;
+	padding: 4px 8px;
+	font-size: 13px;
+	color: var(--text-color-mid, #666);
+}
+.cn-toolbar-select {
+	padding: 4px 8px;
+	border: 1px solid var(--border-color-low, #ccc);
+	border-radius: 4px;
+	background: var(--background);
+	color: var(--text-color-high, #333);
+	margin: 0 6px;
+}
+.cn-toolbar-btn {
+	padding: 4px 12px;
+	background: #3b82f6;
+	color: #fff;
+	border: 1px solid #3b82f6;
+	border-radius: 4px;
+	cursor: pointer;
+	font-size: 13px;
+}
+.cn-toolbar-btn:hover { background: #2563eb; }
+.cn-toolbar-btn:disabled { opacity: 0.5; cursor: wait; }
+</style>
+
+<li id="cn_toolbar" class="tool_label" style="display:none;">
+	<span class="cn-toolbar-label"><%:Active Config%>:</span>
+	<select class="cn-toolbar-select" id="cn_cfg_name"></select>
+	<input type="button" class="cn-toolbar-btn" value="<%:Switch%>" onclick="return cnSwitchConfig(this)"/>
+</li>
+
+<script type="text/javascript">//<![CDATA[
+(function() {
+	var urls = {
+		config_name:   '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "config_name")%>',
+		switch_config: '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "switch_config")%>'
+	};
+
+	var toolbarEl   = document.getElementById('cn_toolbar');
+	var selectEl    = document.getElementById('cn_cfg_name');
+
+	function insertAfter(newEl, target) {
+		var parent = target.parentNode;
+		if (parent.lastChild === target) parent.appendChild(newEl);
+		else parent.insertBefore(newEl, target.nextSibling);
+	}
+
+	// Anchor the toolbar next to the Logs tab in the CBI tabmenu. If the tab
+	// layout hasn't rendered yet, retry briefly (same pattern as OpenClash).
+	function mount() {
+		var anchor = document.getElementsByClassName('tabmenu-item-log');
+		if (anchor && anchor.length > 0) {
+			insertAfter(toolbarEl, anchor[0]);
+		} else {
+			setTimeout(mount, 100);
+		}
+	}
+
+	function load() {
+		XHR.get(urls.config_name, null, function(x, data) {
+			if (!(x && x.status === 200 && data && data.config_name && data.config_name.length > 0)) {
+				toolbarEl.style.display = 'none';
+				return;
+			}
+			toolbarEl.style.display = '';
+			selectEl.innerHTML = '';
+			for (var i = 0; i < data.config_name.length; i++) {
+				var opt = new Option(data.config_name[i].name, data.config_name[i].name);
+				selectEl.appendChild(opt);
+			}
+			if (data.config_path) selectEl.value = data.config_path;
+		});
+	}
+
+	window.cnSwitchConfig = function(btn) {
+		if (!selectEl.value) return false;
+		btn.disabled = true;
+		XHR.get(urls.switch_config, { config_name: selectEl.value }, function(x, data) {
+			btn.disabled = false;
+			if (x && x.status === 200 && data && data.status === 'success') {
+				alert('<%:Config%>: ' + selectEl.value + ' <%:switched successfully%>');
+				window.location.href = location.pathname;
+			} else {
+				alert('<%:Config%>: ' + selectEl.value + ' <%:switch failed%>');
+			}
+		});
+		return false;
+	};
+
+	mount();
+	load();
+})();
+//]]></script>

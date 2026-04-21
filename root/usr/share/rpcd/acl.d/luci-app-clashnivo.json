@@ -1,0 +1,11 @@
+{
+	"luci-app-clashnivo": {
+		"description": "Grant UCI access for luci-app-clashnivo",
+		"read": {
+			"uci": [ "clashnivo" ]
+		},
+		"write": {
+			"uci": [ "clashnivo" ]
+		}
+	}
+}

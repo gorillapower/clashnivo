@@ -1,0 +1,226 @@
+<%#
+Log tail viewer for Clash Nivo.
+
+Fresh Epic 1 implementation. OpenClash's log.htm (946 LOC) carries CodeMirror
+editors, smooth batched line animation, WebSocket reconnection logic, and
+bilingual line translation — none of which are Epic 1 requirements. This
+is a minimal two-pane viewer:
+  - App Log pane: HTTP polling of refresh_log endpoint (1s)
+  - Core Log pane: WebSocket to mihomo /logs when running, polling fallback
+
+Epic 5 will revisit polish (download button, search, filtering).
+%>
+<%+cbi/valueheader%>
+
+<style>
+.cn-log-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
+.cn-log-tab {
+	padding: 6px 14px;
+	border: 1px solid var(--border-color-low, #ccc);
+	background: var(--background);
+	color: var(--text-color-high, #333);
+	cursor: pointer;
+	border-radius: 4px 4px 0 0;
+	font-size: 13px;
+}
+.cn-log-tab.active {
+	background: #3b82f6;
+	color: #fff;
+	border-color: #3b82f6;
+}
+.cn-log-toolbar {
+	display: flex;
+	align-items: center;
+	gap: 10px;
+	margin: 6px 0 10px;
+	flex-wrap: wrap;
+}
+.cn-log-toolbar select, .cn-log-toolbar button {
+	padding: 4px 10px;
+	border: 1px solid var(--border-color-low, #ccc);
+	background: var(--background);
+	color: var(--text-color-high, #333);
+	border-radius: 4px;
+	font-size: 13px;
+	cursor: pointer;
+}
+.cn-log-pane {
+	display: none;
+	height: 520px;
+	overflow: auto;
+	padding: 8px 10px;
+	background: #0f172a;
+	color: #e2e8f0;
+	font-family: Menlo, Monaco, Consolas, "Courier New", monospace;
+	font-size: 12px;
+	line-height: 1.4;
+	white-space: pre-wrap;
+	word-break: break-all;
+	border-radius: 4px;
+}
+.cn-log-pane.active { display: block; }
+.cn-log-muted { color: var(--text-color-mid, #888); font-size: 12px; }
+</style>
+
+<div class="cn-log-tabs">
+	<button type="button" class="cn-log-tab active" id="cn-tab-app"  onclick="cnLogShow('app')"><%:App Log%></button>
+	<button type="button" class="cn-log-tab"        id="cn-tab-core" onclick="cnLogShow('core')"><%:Core Log%></button>
+</div>
+
+<div class="cn-log-toolbar">
+	<span class="cn-log-muted"><%:Log Level%>:</span>
+	<select id="cn-log-level" onchange="cnLogLevelChange(this)">
+		<option value="silent">silent</option>
+		<option value="error">error</option>
+		<option value="warning">warning</option>
+		<option value="info">info</option>
+		<option value="debug">debug</option>
+	</select>
+	<button type="button" onclick="cnLogClear()"><%:Clear%></button>
+	<span class="cn-log-muted" id="cn-log-status">—</span>
+</div>
+
+<pre class="cn-log-pane active" id="cn-pane-app"></pre>
+<pre class="cn-log-pane"        id="cn-pane-core"></pre>
+
+<script type="text/javascript">//<![CDATA[
+(function() {
+	var urls = {
+		status:      '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "status")%>',
+		refresh_log: '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "refresh_log")%>',
+		del_log:     '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "del_log")%>',
+		log_level:   '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "log_level")%>',
+		switch_log:  '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "switch_log")%>'
+	};
+
+	var logLen       = 0;
+	var coreWs       = null;
+	var coreRetryT   = null;
+	var coreRetryMs  = 5000;
+	var currentLevel = 'info';
+
+	function pane(which) { return document.getElementById('cn-pane-' + which); }
+
+	function appendLog(which, text) {
+		if (!text) return;
+		var el = pane(which);
+		var wasAtBottom = (el.scrollTop + el.clientHeight >= el.scrollHeight - 20);
+		el.textContent += (el.textContent ? '\n' : '') + text;
+		// Keep a sane buffer — trim to last 2000 lines.
+		var lines = el.textContent.split('\n');
+		if (lines.length > 2000) {
+			el.textContent = lines.slice(lines.length - 2000).join('\n');
+		}
+		if (wasAtBottom) el.scrollTop = el.scrollHeight;
+	}
+
+	window.cnLogShow = function(which) {
+		document.getElementById('cn-tab-app').classList.toggle('active',  which === 'app');
+		document.getElementById('cn-tab-core').classList.toggle('active', which === 'core');
+		pane('app').classList.toggle('active',  which === 'app');
+		pane('core').classList.toggle('active', which === 'core');
+	};
+
+	window.cnLogClear = function() {
+		XHR.get(urls.del_log, null, function() {
+			pane('app').textContent = '';
+			pane('core').textContent = '';
+			logLen = 0;
+		});
+	};
+
+	window.cnLogLevelChange = function(sel) {
+		currentLevel = sel.value;
+		XHR.get(urls.switch_log, { log_level: sel.value }, function() {
+			// Rebuild core WS with new level filter
+			stopCoreWs();
+			startCoreWs();
+		});
+	};
+
+	function pollAppLog() {
+		XHR.get(urls.refresh_log, { log_len: logLen, core_refresh: (coreWs == null || coreWs.readyState !== 1) },
+			function(x, data) {
+				if (x && x.status === 200 && data) {
+					if (data.len) logLen = data.len;
+					if (data.update) {
+						if (data.oc_log)   appendLog('app', data.oc_log);
+						if (data.core_log) appendLog('core', data.core_log);
+					}
+				}
+				setTimeout(pollAppLog, 1500);
+			}
+		);
+	}
+
+	function stopCoreWs() {
+		if (coreRetryT) { clearTimeout(coreRetryT); coreRetryT = null; }
+		if (coreWs) {
+			try { coreWs.onopen = coreWs.onmessage = coreWs.onerror = coreWs.onclose = null; } catch(e) {}
+			try { coreWs.close(); } catch(e) {}
+			coreWs = null;
+		}
+	}
+
+	function retryCoreWs() {
+		coreRetryT = setTimeout(startCoreWs, coreRetryMs);
+	}
+
+	function pad(n) { return n < 10 ? '0' + n : n; }
+	function ts() {
+		var d = new Date();
+		return d.getFullYear() + '-' + pad(d.getMonth()+1) + '-' + pad(d.getDate()) + ' ' +
+		       pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds());
+	}
+
+	function startCoreWs() {
+		stopCoreWs();
+		XHR.get(urls.status, null, function(x, s) {
+			if (!(x && x.status === 200 && s && s.daip && s.cn_port && s.running)) {
+				document.getElementById('cn-log-status').textContent = '<%:Core not running%>';
+				retryCoreWs();
+				return;
+			}
+			document.getElementById('cn-log-status').textContent = '<%:Connected%>';
+
+			var protocol = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+			var url = protocol + s.daip + ':' + s.cn_port + '/logs?token=' + encodeURIComponent(s.dase || '') + '&level=' + currentLevel;
+			try {
+				coreWs = new WebSocket(url);
+				coreWs.onmessage = function(ev) {
+					if (!ev.data) return;
+					try {
+						var m = JSON.parse(ev.data);
+						if (m && m.payload) appendLog('core', ts() + ' [' + (m.type || 'info') + '] ' + m.payload);
+					} catch(e) { /* ignore */ }
+				};
+				coreWs.onerror = function() {
+					document.getElementById('cn-log-status').textContent = '<%:Disconnected%>';
+					retryCoreWs();
+				};
+				coreWs.onclose = function(ev) {
+					document.getElementById('cn-log-status').textContent = '<%:Disconnected%>';
+					coreWs = null;
+					if (!ev.wasClean) retryCoreWs();
+				};
+			} catch (e) {
+				retryCoreWs();
+			}
+		});
+	}
+
+	function loadLevel() {
+		XHR.get(urls.log_level, null, function(x, d) {
+			if (x && x.status === 200 && d && d.log_level) {
+				currentLevel = d.log_level;
+				document.getElementById('cn-log-level').value = d.log_level;
+			}
+		});
+	}
+
+	loadLevel();
+	pollAppLog();
+	startCoreWs();
+})();
+//]]></script>
+<%+cbi/valuefooter%>

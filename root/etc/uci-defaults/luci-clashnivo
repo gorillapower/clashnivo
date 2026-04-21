@@ -1,0 +1,131 @@
+#!/bin/sh
+# First-boot initialisation for Clash Nivo. Runs once after package install,
+# then self-deletes. Populates auto-generated UCI values that cannot be
+# shipped in /etc/config/clashnivo (per-device secrets, architecture-specific
+# binary selector, host dnsmasq state snapshot). See docs/architecture/uci-schema.md §8.
+. /lib/functions.sh
+. /usr/share/clashnivo/uci.sh
+
+# ucitrack: triggers an init.d reload whenever clashnivo config is committed.
+[ -e "/etc/config/ucitrack" ] && {
+	uci -q delete ucitrack.@clashnivo[-1]
+	uci -q add ucitrack clashnivo
+	uci -q set ucitrack.@clashnivo[-1].init=clashnivo
+	uci -q commit ucitrack
+}
+
+# firewall include: init.d (re)creates /var/etc/clashnivo.include at start; the
+# UCI stub here lets firewall restarts replay our rules without init.d bouncing.
+uci -q delete firewall.clashnivo
+uci -q set firewall.clashnivo=include
+uci -q set firewall.clashnivo.type=script
+uci -q set firewall.clashnivo.path=/var/etc/clashnivo.include
+[ -n "$(command -v fw4)" ] || uci -q set firewall.clashnivo.reload=1
+uci -q commit firewall
+
+mkdir -p /etc/clashnivo/config
+mkdir -p /etc/clashnivo/custom
+mkdir -p /etc/clashnivo/core
+mkdir -p /etc/clashnivo/history
+mkdir -p /usr/share/clashnivo/backup/overwrite
+
+# Preserve user config across package reinstalls / sysupgrade.
+mkdir -p /lib/upgrade/keep.d
+cat > "/lib/upgrade/keep.d/luci-app-clashnivo" <<-EOF
+	/etc/clashnivo/
+EOF
+
+# Dashboard / REST API secret. Same 8-char token fills both
+# clashnivo.config.dashboard_password and @authentication[0].password so the
+# Mihomo controller and LuCI basic-auth proxy share one credential.
+gen_secret() {
+	tr -cd 'a-zA-Z0-9' </dev/urandom 2>/dev/null | head -c8 || date +%N | md5sum | head -c8
+}
+
+DASHBOARD_PASSWORD="$(uci_get_config dashboard_password)"
+if [ -z "$DASHBOARD_PASSWORD" ] || [ "$DASHBOARD_PASSWORD" = "0" ]; then
+	DASHBOARD_PASSWORD="$(gen_secret)"
+	uci -q set clashnivo.config.dashboard_password="$DASHBOARD_PASSWORD"
+fi
+
+if [ -z "$(uci -q get clashnivo.@authentication[0])" ]; then
+	auth_sid=$(uci -q add clashnivo authentication)
+	uci -q set clashnivo."$auth_sid".enabled='1'
+	uci -q set clashnivo."$auth_sid".username='Clash'
+	uci -q set clashnivo."$auth_sid".password="$DASHBOARD_PASSWORD"
+fi
+
+# Mihomo release asset selector. Must match an entry on
+# https://github.com/MetaCubeX/mihomo/releases (mihomo-<ARCH>-<ver>.gz).
+# clashnivo_core.sh refuses to run if this is empty or "0".
+CORE_ARCH="0"
+[ -r "/etc/openwrt_release" ] && . /etc/openwrt_release
+case "${DISTRIB_ARCH}" in
+	aarch64_*)
+		CORE_ARCH="linux-arm64"
+		;;
+	arm_*)
+		CORE_ARCH="linux-armv7"
+		;;
+	i386_*)
+		CORE_ARCH="linux-386"
+		;;
+	mips_*)
+		CORE_ARCH="linux-mips-softfloat"
+		;;
+	mipsel_*)
+		CORE_ARCH="linux-mipsle-softfloat"
+		;;
+	riscv64_*)
+		CORE_ARCH="linux-riscv64"
+		;;
+	loongarch64_*)
+		CORE_ARCH="linux-loong64"
+		;;
+	x86_64)
+		CORE_ARCH="linux-amd64"
+		;;
+esac
+
+# Fallback if DISTRIB_ARCH is absent (non-stock OpenWrt builds) or unrecognised.
+if [ "$CORE_ARCH" = "0" ]; then
+	case "$(uname -m)" in
+		aarch64)    CORE_ARCH="linux-arm64" ;;
+		armv7l)     CORE_ARCH="linux-armv7" ;;
+		i386|i686)  CORE_ARCH="linux-386" ;;
+		mips)       CORE_ARCH="linux-mips-softfloat" ;;
+		mipsel)     CORE_ARCH="linux-mipsle-softfloat" ;;
+		riscv64)    CORE_ARCH="linux-riscv64" ;;
+		loongarch64) CORE_ARCH="linux-loong64" ;;
+		x86_64)     CORE_ARCH="linux-amd64" ;;
+	esac
+fi
+
+if [ -z "$(uci_get_config core_version)" ] || [ "$(uci_get_config core_version)" = "0" ]; then
+	uci -q set clashnivo.config.core_version="$CORE_ARCH"
+fi
+
+# Snapshot the host's dnsmasq resolvfile so revert_dns() can restore it on
+# service stop even if the host config changes in the meantime.
+resolvfile="$(uci -q get dhcp.@dnsmasq[0].resolvfile)"
+if [ -n "$resolvfile" ]; then
+	uci -q set clashnivo.config.default_resolvfile="$resolvfile"
+fi
+
+# Mihomo's bundled quic-go triggers "invalid argument" UDP sendmsg errors on
+# kernels ≥ 6.6 unless QUIC_GO_DISABLE_GSO=true. init.d reads this flag and
+# exports the env var at core start.
+current_kernel="$(uname -r | cut -d'-' -f1)"
+if [ "$(printf '%s\n%s\n' "$current_kernel" "6.6" | sort -V | head -n1)" != "$current_kernel" ]; then
+	uci -q set clashnivo.config.disable_quic_go_gso='1'
+fi
+
+uci -q commit clashnivo
+
+# Refresh rpcd ACL grants and drop LuCI's route cache so the app nav appears
+# without a shell login. No-ops on first install before the LuCI shell ships.
+[ -f /etc/init.d/rpcd ] && /etc/init.d/rpcd reload >/dev/null 2>&1
+rm -f /tmp/luci-indexcache /tmp/luci-indexcache.* >/dev/null 2>&1
+
+rm -f "$0"
+exit 0

@@ -111,7 +111,7 @@ must be changed before release (see **Open Q2**).
 | `append_default_dns` | bool | `0` | Append WAN DNS to upstream list | Stage 7 |
 | `append_wan_dns` | bool | `0` | Append WAN nameservers to `nameserver` group | Stage 7 |
 | `enable_custom_domain_dns_server` | bool | `0` | Enable per-domain DNS server overrides | Stage 9 (`clashnivo_custom_domain_dns.sh`) |
-| `custom_domain_dns_server` | host | `114.114.114.114` | DNS server for custom-domain list | Stage 9 |
+| `custom_domain_dns_server` | host | `8.8.8.8` | DNS server for custom-domain list | Stage 9 |
 | `disable_masq_cache` | bool | `1` | Set dnsmasq cachesize=0 while service runs | Stage 9 |
 | `default_resolvfile` | path | (auto) | dnsmasq resolvfile backup (set at first boot) | Stage 9 |
 | `redirect_dns` | bool | — | Backup of dnsmasq redirect state (init.d internal) | Stage 9 restore |

@@ -27,6 +27,7 @@ mkdir -p /etc/clashnivo/config
 mkdir -p /etc/clashnivo/custom
 mkdir -p /etc/clashnivo/core
 mkdir -p /etc/clashnivo/history
+mkdir -p /etc/clashnivo/rule_provider
 mkdir -p /usr/share/clashnivo/backup/overwrite
 
 # Preserve user config across package reinstalls / sysupgrade.

@@ -7,7 +7,8 @@ Scope status:
   - Epic 2 (subscription mgmt + config file manager) — implemented.
   - Epic 3a (custom servers + URL import) — implemented.
   - Epic 3b (custom groups) — implemented.
-  - Epic 3c/3d (custom rules/overwrite) — routes stubbed.
+  - Epic 3c (custom rules + rule providers) — implemented.
+  - Epic 3d (config overwrite) — routes stubbed.
   - Epic 4 (core binary mgmt) — routes stubbed.
   - Epic 5 (diagnostics, flush DNS) — routes stubbed.
   - OpenClash features cut in v1 (streaming unlock, smart/LightGBM, chnroute,
@@ -42,6 +43,9 @@ function index()
 	-- Epic 3b pages
 	entry({"admin", "services", "clashnivo", "custom-groups"},       cbi("clashnivo/custom-groups"),       _("Custom Groups"), 60).leaf = true
 	entry({"admin", "services", "clashnivo", "custom-groups-edit"},  cbi("clashnivo/custom-groups-edit"),  nil).leaf = true
+	-- Epic 3c pages
+	entry({"admin", "services", "clashnivo", "custom-rules"},        cbi("clashnivo/custom-rules"),        _("Custom Rules"),  70).leaf = true
+	entry({"admin", "services", "clashnivo", "custom-rules-edit"},   cbi("clashnivo/custom-rules-edit"),   nil).leaf = true
 	entry({"admin", "services", "clashnivo", "log"},               cbi("clashnivo/log"),               _("Logs"),          90).leaf = true
 
 	-- Epic 1 AJAX endpoints (implemented)

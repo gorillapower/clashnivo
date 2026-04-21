@@ -2075,6 +2075,10 @@ start_service()
          "$enable_respect_rules" "$custom_fakeip_filter_mode" "$iptables_compat" "$disable_quic_go_gso" "$cors_allow" \
          "$geo_custom_url" "$geoip_custom_url" "$geosite_custom_url"
 
+         # Merge UCI rule_provider entries before yml_rules_change.sh so its
+         # path normalization + CDN rewrites apply to our injected providers too.
+         /usr/share/clashnivo/clashnivo_yml_rule_provider_set.sh "$TMP_CONFIG_FILE"
+
          /usr/share/clashnivo/clashnivo_yml_rules_change.sh \
          "$enable_custom_clash_rules" "$TMP_CONFIG_FILE" \
          "$enable_rule_proxy" "$router_self_proxy" "$lan_ip" "$enable_redirect_dns" "$en_mode"

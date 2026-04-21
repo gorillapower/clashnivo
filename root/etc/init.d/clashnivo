@@ -408,7 +408,7 @@ do_run_file()
    [ ! -f "$CLASH" ] && {
       LOG_TIP "Detected that the Core is not Installed, Ready to Download..."
       rm -rf "/tmp/mihomo_last_version"
-      /usr/share/clashnivo/clashnivo_core.sh "Meta"
+      /usr/share/clashnivo/clashnivo_core.sh
       if [ ! -f "$CLASH" ]; then
          start_fail
       fi

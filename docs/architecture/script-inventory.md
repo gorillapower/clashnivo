@@ -393,12 +393,11 @@ fake-ip-filter / use-hosts), the sniffer block, the TUN block, NTP, and
 - `custom_fallback_filter` (arg `$custom_fallback_filter`) and the
   `/etc/openclash/custom/openclash_custom_fallback_filter.yaml` read.
   Deprecated in recent Mihomo; not worth carrying forward.
-- Dashboard selector: drop `default_dashboard`, `yacd_type`,
-  `dashboard_type` UCI reads and the four-branch `case` emitting
-  `external-ui-url` (lines ~413–431). Hard-code `external-ui-name =
-  metacubexd` and the metacubexd release URL. The LuCI UI is the primary
-  surface; the mihomo-bundled dashboard is a secondary debug view and
-  does not need to be user-selectable.
+- Dashboard selector: drop `default_dashboard` and `yacd_type` UCI reads
+  and collapse the four-branch `case` emitting `external-ui-url`
+  (lines ~413–431) to a two-branch one. `dashboard_type` is **kept** per
+  `uci-schema.md` §1.7 (default `zashboard`, alternative `metacubexd`);
+  both dashboards ship and the user picks via the settings UI.
 - Chinese log strings throughout every `YAML.LOG_TIP` / `LOG_ERROR`.
 
 ### Rewrite

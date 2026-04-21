@@ -171,11 +171,23 @@ error is visible, the UI is tested on multiple OpenWrt versions.
 
 ## Current Batch
 
-1. Pre-build audit — script inventory (openclash.sh, init.d, yml_*.sh, core, helpers)
-2. Pre-build audit — UCI schema definition
-3. Epic 0 — begin scaffold: fork init.d, copy helper scripts, rename throughout
-4. Epic 0 — UCI defaults and Makefile
-5. Epic 0 — validate one subscription download produces a startable config
+Epics 0–3d are landed. Remaining near-term work:
+
+1. **On-device verification for Epic 3d** — install the package on a test
+   router and walk the checklist: (a) inline source writes body to
+   `/etc/clashnivo/overwrite/<name>` with a `[YAML]` header; (b) preview
+   diff renders against the active config; (c) enabled + restart applies
+   the overlay; (d) http source's `update_days`/`update_hour` appear as a
+   `#clashnivo-overwrite-download` entry in `/etc/crontabs/root`.
+2. **Vendor CodeMirror assets** — drop `codemirror.js`, YAML mode, and a
+   theme under `root/www/luci-static/resources/clashnivo/` per
+   repo-layout.md §99, then swap the plain `TextValue` textarea in
+   `config-overwrite-edit.lua` for a CodeMirror-backed editor. Also
+   replace the `<pre>` diff block with a side-by-side diff view.
+3. Epic 4 — core binary management (install/update Mihomo from UI, version
+   display, arch detection in `clashnivo_core.sh`).
+4. Epic 5 — polish pass (field descriptions, error surfacing, LAN AC,
+   BT/PT DIRECT, geo-update schedule, flush-DNS button, multi-version test).
 
 ---
 

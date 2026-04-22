@@ -171,26 +171,33 @@ revert_dns() {
 
    /etc/init.d/dnsmasq restart
 
-   masq_port=$(uci -q get dhcp.@dnsmasq[0].port)
-   if [ "$(nslookup www.apple.com 127.0.0.1:${masq_port} >/dev/null 2>&1 || echo $?)" = "1" ]; then
-      resolv_file=$(uci -q get dhcp.@dnsmasq[0].resolvfile)
-      wan_dns=$(/usr/share/clashnivo/clashnivo_get_network.lua "dns")
-      mkdir -p "$(dirname "$resolv_file")"
-      touch "$resolv_file"
+   # Only probe-and-recover dnsmasq upstream when this revert actually moved
+   # state — i.e. we undid redirect_dns ($1=1) or cachesize_dns ($6=1). On a
+   # "nothing to revert" stop (fresh install, or a start that bailed at
+   # Config-Not-Found), rewriting resolvfile would corrupt working upstream.
+   if [ "$1" = "1" ] || [ "$6" = "1" ]; then
+      masq_port=$(uci -q get dhcp.@dnsmasq[0].port)
+      [ -z "$masq_port" ] && masq_port=53
+      if [ "$(nslookup www.apple.com 127.0.0.1:${masq_port} >/dev/null 2>&1 || echo $?)" = "1" ]; then
+         resolv_file=$(uci -q get dhcp.@dnsmasq[0].resolvfile)
+         wan_dns=$(/usr/share/clashnivo/clashnivo_get_network.lua "dns")
+         mkdir -p "$(dirname "$resolv_file")"
+         touch "$resolv_file"
 
-      if [ -n "$wan_dns" ]; then
-         echo "# Interface lan" > "$resolv_file"
-         for dns in $wan_dns; do
-            echo "nameserver $dns" >> "$resolv_file"
-         done
-      else
-         cat > "$resolv_file" <<-EOF
+         if [ -n "$wan_dns" ]; then
+            echo "# Interface lan" > "$resolv_file"
+            for dns in $wan_dns; do
+               echo "nameserver $dns" >> "$resolv_file"
+            done
+         else
+            cat > "$resolv_file" <<-EOF
 # Interface lan
 nameserver 1.1.1.1
 nameserver 8.8.8.8
 EOF
+         fi
+         /etc/init.d/dnsmasq restart
       fi
-      /etc/init.d/dnsmasq restart
    fi
 
 } >/dev/null 2>&1
@@ -2135,6 +2142,19 @@ start_service()
 stop_service()
 {
    get_config
+
+   # No-op fast path: if nothing was ever started or registered, skip the
+   # revert work entirely. Running revert_dnsmasq on a fresh system restarts
+   # dnsmasq unnecessarily, and the nslookup smoke test inside revert_dns
+   # can rewrite resolvfile when it has no reason to.
+   if ! pidof mihomo >/dev/null 2>&1 \
+      && [ "$(uci_get_config redirect_dns)" != "1" ] \
+      && [ -z "$(uci -q get clashnivo.config.dnsmasq_server)" ] \
+      && [ ! -f /var/etc/clashnivo.include ]; then
+      LOG_TIP "Clash Nivo Not Running And No Residual State, Skipping Revert..."
+      echo "Clash Nivo Already Stop!"
+      return 0
+   fi
 
    LOG_TIP "Clash Nivo Stoping..."
 

@@ -140,15 +140,17 @@ value proposition of the app.
 
 ---
 
-### Epic 4 — Binary management
+### Epic 4 — Binary management ✅
 
 **Goal:** Users can install and update the Mihomo core from within the UI.
 
 **Outputs:**
-- Core install/update button on the overview page
-- Version display (installed vs. latest)
-- `clashnivo_core.sh` correctly downloads for the router's architecture
-- `clashnivo_version.sh` checks upstream release
+- Core install/update button on the overview page (`view/clashnivo/core_manage.htm`)
+- Version display (installed vs. latest) — controller `action_check_core`
+- `clashnivo_core.sh` downloads for the router's architecture with SHA256
+  verification (already landed in Epic 0)
+- `clashnivo_version.sh` checks upstream release, caches to
+  `/tmp/mihomo_last_version`, returns JSON for the controller
 
 ---
 
@@ -171,7 +173,7 @@ error is visible, the UI is tested on multiple OpenWrt versions.
 
 ## Current Batch
 
-Epics 0–3d are landed. Remaining near-term work:
+Epics 0–4 are landed. Remaining near-term work:
 
 1. **On-device verification for Epic 3d** — install the package on a test
    router and walk the checklist: (a) inline source writes body to
@@ -179,13 +181,18 @@ Epics 0–3d are landed. Remaining near-term work:
    diff renders against the active config; (c) enabled + restart applies
    the overlay; (d) http source's `update_days`/`update_hour` appear as a
    `#clashnivo-overwrite-download` entry in `/etc/crontabs/root`.
-2. **Vendor CodeMirror assets** — drop `codemirror.js`, YAML mode, and a
+2. **On-device verification for Epic 4** — install the package, then from
+   the overview page: (a) Check-for-Updates populates installed + latest;
+   (b) arch selector writes `clashnivo.config.core_version`;
+   (c) Install/Update runs `clashnivo_core.sh`, streams progress via
+   `/tmp/clashnivo_start.log`, and drops the binary at
+   `/etc/clashnivo/core/mihomo` (or `/tmp/...` if `small_flash_memory=1`);
+   (d) SHA256 mismatch aborts cleanly.
+3. **Vendor CodeMirror assets** — drop `codemirror.js`, YAML mode, and a
    theme under `root/www/luci-static/resources/clashnivo/` per
    repo-layout.md §99, then swap the plain `TextValue` textarea in
    `config-overwrite-edit.lua` for a CodeMirror-backed editor. Also
    replace the `<pre>` diff block with a side-by-side diff view.
-3. Epic 4 — core binary management (install/update Mihomo from UI, version
-   display, arch detection in `clashnivo_core.sh`).
 4. Epic 5 — polish pass (field descriptions, error surfacing, LAN AC,
    BT/PT DIRECT, geo-update schedule, flush-DNS button, multi-version test).
 

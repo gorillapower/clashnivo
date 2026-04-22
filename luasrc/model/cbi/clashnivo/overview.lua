@@ -10,6 +10,7 @@ m.reset = false
 m.submit = false
 
 m:section(SimpleSection).template = "clashnivo/status"
+m:section(SimpleSection).template = "clashnivo/core_manage"
 
 m:append(Template("clashnivo/toolbar_show"))
 

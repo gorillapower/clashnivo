@@ -49,6 +49,7 @@ luci-app-clashnivo/
 │   │
 │   └── view/clashnivo/
 │       ├── status.htm                     # Running status widget (AJAX-polled)
+│       ├── core_manage.htm                # Mihomo core install/update card (Epic 4)
 │       ├── log.htm                        # Log tail view
 │       ├── toolbar_show.htm               # Bottom toolbar (start/stop/reload buttons)
 │       ├── switch_mode.htm                # Inline mode switcher widget

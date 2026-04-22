@@ -95,12 +95,13 @@ function index()
 	entry({"admin", "services", "clashnivo", "create_file"},          call("stub_not_implemented"))
 	entry({"admin", "services", "clashnivo", "rename_file"},          call("stub_not_implemented"))
 
-	-- Epic 4 (core binary management) — routes stubbed
-	entry({"admin", "services", "clashnivo", "check_core"},     call("stub_not_implemented"))
-	entry({"admin", "services", "clashnivo", "core_download"},  call("stub_not_implemented"))
-	entry({"admin", "services", "clashnivo", "coreupdate"},     call("stub_not_implemented"))
-	entry({"admin", "services", "clashnivo", "lastversion"},    call("stub_not_implemented"))
-	entry({"admin", "services", "clashnivo", "get_last_version"}, call("stub_not_implemented"))
+	-- Epic 4 (core binary management)
+	entry({"admin", "services", "clashnivo", "check_core"},       call("action_check_core")).leaf = true
+	entry({"admin", "services", "clashnivo", "core_download"},    call("action_core_download")).leaf = true
+	entry({"admin", "services", "clashnivo", "coreupdate"},       call("action_core_download")).leaf = true
+	entry({"admin", "services", "clashnivo", "lastversion"},      call("action_lastversion")).leaf = true
+	entry({"admin", "services", "clashnivo", "get_last_version"}, call("action_lastversion")).leaf = true
+	-- self-upgrade (luci-app-openclash's update/update_info/update_ma) is out of v1 scope
 	entry({"admin", "services", "clashnivo", "update"},         call("stub_not_implemented"))
 	entry({"admin", "services", "clashnivo", "update_info"},    call("stub_not_implemented"))
 	entry({"admin", "services", "clashnivo", "update_ma"},      call("stub_not_implemented"))
@@ -1331,5 +1332,138 @@ function action_config_overwrite_preview()
 	luci.http.write_json({
 		status = "success",
 		diff   = table.concat(cleaned, "\n"),
+	})
+end
+
+-- ---------------------------------------------------------------------------
+-- Epic 4: Mihomo core binary management
+--
+-- `check_core` runs clashnivo_version.sh (network call), returns installed +
+-- latest + arch. `core_download` kicks off clashnivo_core.sh in the background
+-- and relies on action_start (startlog tail) for progress. `lastversion`
+-- reads the cached /tmp/mihomo_last_version without hitting GitHub — cheap
+-- polling option for the overview page.
+-- ---------------------------------------------------------------------------
+
+local function core_path()
+	local small_flash = fs.uci_get_config("config", "small_flash_memory")
+	if small_flash == "1" then
+		return "/tmp/etc/clashnivo/core/mihomo"
+	end
+	return "/etc/clashnivo/core/mihomo"
+end
+
+local function core_downloading()
+	return fs.access("/tmp/lock/clashnivo_core.lock")
+end
+
+local function supported_arches()
+	return {
+		"linux-amd64",
+		"linux-amd64-compatible",
+		"linux-386",
+		"linux-arm64",
+		"linux-armv7",
+		"linux-armv6",
+		"linux-armv5",
+		"linux-mips-softfloat",
+		"linux-mips-hardfloat",
+		"linux-mipsle-softfloat",
+		"linux-mipsle-hardfloat",
+		"linux-mips64",
+		"linux-mips64le",
+		"linux-riscv64",
+		"linux-loong64",
+	}
+end
+
+local function is_supported_arch(arch)
+	if not arch or arch == "" or arch == "0" then return false end
+	for _, a in ipairs(supported_arches()) do
+		if a == arch then return true end
+	end
+	return false
+end
+
+function action_check_core()
+	luci.http.prepare_content("application/json")
+	local out = luci.sys.exec("/usr/share/clashnivo/clashnivo_version.sh 2>/dev/null") or ""
+	local info = json.parse(out) or {}
+	info.core_exists = fs.access(core_path()) and true or false
+	info.downloading = core_downloading()
+	info.running     = is_running()
+	info.arches      = supported_arches()
+	luci.http.write_json(info)
+end
+
+function action_core_download()
+	luci.http.prepare_content("application/json")
+
+	if core_downloading() then
+		luci.http.write_json({
+			status  = "error",
+			message = "A core download is already in progress"
+		})
+		return
+	end
+
+	local arch = luci.http.formvalue("arch")
+	if arch and arch ~= "" then
+		if not is_supported_arch(arch) then
+			luci.http.write_json({
+				status  = "error",
+				message = "Unsupported architecture: " .. arch
+			})
+			return
+		end
+		uci:set("clashnivo", "config", "core_version", arch)
+		uci:commit("clashnivo")
+	else
+		local current = fs.uci_get_config("config", "core_version")
+		if not current or current == "" or current == "0" then
+			luci.http.write_json({
+				status  = "error",
+				message = "No architecture selected — pass arch=<linux-*> or set core_version in UCI"
+			})
+			return
+		end
+	end
+
+	-- Clear the startlog so the UI sees fresh progress lines.
+	luci.sys.exec(": > /tmp/clashnivo_start.log")
+	-- Invalidate any cached version lookup so check_core re-fetches post-install.
+	os.remove("/tmp/mihomo_last_version")
+
+	luci.sys.call("/usr/share/clashnivo/clashnivo_core.sh >/dev/null 2>&1 &")
+	luci.http.write_json({ status = "started" })
+end
+
+function action_lastversion()
+	luci.http.prepare_content("application/json")
+	local nxfs = require "nixio.fs"
+	local cached = nxfs.readfile("/tmp/mihomo_last_version") or ""
+	cached = cached:gsub("%s+", "")
+
+	local cp = core_path()
+	local installed = ""
+	if fs.access(cp) then
+		installed = (luci.sys.exec("'" .. cp .. "' -v 2>/dev/null | awk '{print $3}' | head -1") or ""):gsub("%s+", "")
+	end
+
+	local arch = fs.uci_get_config("config", "core_version") or ""
+	if arch == "0" then arch = "" end
+
+	local update_available = (installed ~= "" and cached ~= "" and installed ~= cached)
+	                      or (installed == "" and cached ~= "")
+
+	luci.http.write_json({
+		installed        = installed,
+		latest           = cached,
+		arch             = arch,
+		arches           = supported_arches(),
+		update_available = update_available,
+		downloading      = core_downloading(),
+		core_exists      = fs.access(cp) and true or false,
+		running          = is_running(),
 	})
 end

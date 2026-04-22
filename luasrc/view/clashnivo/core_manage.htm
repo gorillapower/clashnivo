@@ -1,0 +1,159 @@
+<%#
+Overview: Mihomo core binary manager (Epic 4).
+
+Renders a card with:
+  - Installed version (from the binary) vs. upstream latest (from the
+    GitHub `version.txt` asset via clashnivo_version.sh).
+  - Architecture selector bound to UCI clashnivo.config.core_version.
+  - Install / Update button that kicks off clashnivo_core.sh in the
+    background, then polls startlog for progress lines.
+
+All network I/O runs server-side; the view just polls check_core and the
+existing startlog endpoint. No page reload on install.
+%>
+
+<div class="cn-card" id="cn-core-card">
+	<h3><%:Mihomo Core%></h3>
+	<div class="cn-row">
+		<span class="cn-label"><%:Installed%>:</span>
+		<span class="cn-value" id="cn-core-installed">—</span>
+	</div>
+	<div class="cn-row">
+		<span class="cn-label"><%:Latest%>:</span>
+		<span class="cn-value" id="cn-core-latest">—</span>
+		<button type="button" class="cn-btn" id="cn-core-check-btn" onclick="cnCoreCheck()"><%:Check for Updates%></button>
+	</div>
+	<div class="cn-row">
+		<span class="cn-label"><%:Architecture%>:</span>
+		<select class="cn-select" id="cn-core-arch"></select>
+		<span class="cn-muted"><%:Must match a mihomo-ARCH-VER.gz release asset%></span>
+	</div>
+	<div class="cn-row">
+		<button type="button" class="cn-btn cn-btn-primary" id="cn-core-install-btn" onclick="cnCoreInstall()"><%:Install / Update Core%></button>
+		<span class="cn-muted" id="cn-core-status">—</span>
+	</div>
+	<div class="cn-row" id="cn-core-log-row" style="display:none;">
+		<pre id="cn-core-log" style="flex:1; margin:0; padding:8px; background:var(--background-low,#f5f5f5); border:1px solid var(--border-color-low,#ccc); border-radius:4px; font-size:12px; max-height:160px; overflow:auto; white-space:pre-wrap;"></pre>
+	</div>
+</div>
+
+<script type="text/javascript">//<![CDATA[
+(function() {
+	var urls = {
+		check_core:    '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "check_core")%>',
+		lastversion:   '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "lastversion")%>',
+		core_download: '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "core_download")%>',
+		startlog:      '<%=luci.dispatcher.build_url("admin", "services", "clashnivo", "startlog")%>'
+	};
+
+	var pollTimer = null;
+	var installedArch = null;
+
+	function setButtons(disabled) {
+		document.getElementById('cn-core-check-btn').disabled = disabled;
+		document.getElementById('cn-core-install-btn').disabled = disabled;
+	}
+
+	function populateArches(arches, selected) {
+		var sel = document.getElementById('cn-core-arch');
+		if (sel.options.length > 0 && !arches) return;
+		sel.innerHTML = '';
+		(arches || []).forEach(function(a) {
+			var opt = document.createElement('option');
+			opt.value = a;
+			opt.textContent = a;
+			if (a === selected) opt.selected = true;
+			sel.appendChild(opt);
+		});
+		if (selected && sel.value !== selected) {
+			var opt = document.createElement('option');
+			opt.value = selected;
+			opt.textContent = selected + ' (custom)';
+			opt.selected = true;
+			sel.appendChild(opt);
+		}
+	}
+
+	function render(info) {
+		document.getElementById('cn-core-installed').textContent = info.installed || '<%:Not installed%>';
+		document.getElementById('cn-core-latest').textContent    = info.latest    || '<%:Unknown%>';
+		populateArches(info.arches, info.arch);
+		installedArch = info.arch || null;
+
+		var statusEl = document.getElementById('cn-core-status');
+		if (info.downloading) {
+			statusEl.textContent = '<%:Downloading…%>';
+			setButtons(true);
+		} else if (!info.core_exists) {
+			statusEl.textContent = '<%:Core binary not installed%>';
+			setButtons(false);
+		} else if (info.update_available) {
+			statusEl.textContent = '<%:Update available%>';
+			setButtons(false);
+		} else if (info.installed && info.latest && info.installed === info.latest) {
+			statusEl.textContent = '<%:Up to date%>';
+			setButtons(false);
+		} else {
+			statusEl.textContent = '—';
+			setButtons(false);
+		}
+	}
+
+	function refresh(useNetwork, cb) {
+		var url = useNetwork ? urls.check_core : urls.lastversion;
+		XHR.get(url, null, function(x, data) {
+			if (x && x.status === 200 && data) render(data);
+			if (typeof cb === 'function') cb();
+		});
+	}
+
+	function pollStartlog() {
+		XHR.get(urls.startlog, null, function(x, data) {
+			if (!x || x.status !== 200 || !data) return;
+			var line = (data.startlog || '').replace(/\s+$/, '');
+			var logEl  = document.getElementById('cn-core-log');
+			var logRow = document.getElementById('cn-core-log-row');
+			if (line && line !== '##FINISH##') {
+				logRow.style.display = 'flex';
+				logEl.textContent = line;
+			}
+			if (line === '##FINISH##') {
+				clearInterval(pollTimer);
+				pollTimer = null;
+				refresh(false);
+			}
+		});
+	}
+
+	window.cnCoreCheck = function() {
+		setButtons(true);
+		document.getElementById('cn-core-status').textContent = '<%:Checking…%>';
+		refresh(true, function() { setButtons(false); });
+	};
+
+	window.cnCoreInstall = function() {
+		var sel = document.getElementById('cn-core-arch');
+		var arch = sel.value;
+		if (!arch) {
+			alert('<%:Pick an architecture first%>');
+			return;
+		}
+		setButtons(true);
+		document.getElementById('cn-core-status').textContent = '<%:Starting…%>';
+		document.getElementById('cn-core-log').textContent = '';
+		document.getElementById('cn-core-log-row').style.display = 'none';
+		XHR.get(urls.core_download, { arch: arch }, function(x, data) {
+			if (data && data.status === 'started') {
+				document.getElementById('cn-core-status').textContent = '<%:Downloading…%>';
+				if (pollTimer) clearInterval(pollTimer);
+				pollTimer = setInterval(pollStartlog, 1500);
+			} else {
+				document.getElementById('cn-core-status').textContent = (data && data.message) || '<%:Failed to start%>';
+				setButtons(false);
+			}
+		});
+	};
+
+	refresh(false);
+})();
+//]]></script>

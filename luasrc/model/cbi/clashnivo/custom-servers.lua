@@ -23,12 +23,18 @@ m = Map("clashnivo", translate("Custom Servers"),
 	translate("Manually-defined proxy nodes. Added on top of every subscription config at assembly time."))
 m.pageaction = false
 
+-- Sub-nav tab bar — first section so it renders above everything else.
+-- See luasrc/view/clashnivo/customize_tabs.htm for why it's drawn manually.
+-- Injected as a Map child (not a separate SimpleForm) so the cbi() dispatcher
+-- still sees a Map first and can process saves/deletes.
+m:section(SimpleSection).template = "clashnivo/customize_tabs"
+
 s = m:section(TypedSection, "servers", translate("Server List"))
 s.anonymous = true
 s.addremove = true
 s.sortable = true
 s.template = "cbi/tblsection"
-s.extedit = DISP.build_url("admin/services/clashnivo/custom-servers-edit/%s")
+s.extedit = DISP.build_url("admin/services/clashnivo/customize/servers-edit/%s")
 
 function s.create(...)
 	local sid = TypedSection.create(...)

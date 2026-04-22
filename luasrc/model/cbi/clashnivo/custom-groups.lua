@@ -22,12 +22,15 @@ m = Map("clashnivo", translate("Custom Groups"),
 	translate("Manually-defined proxy groups. Each group includes every proxy in the active config, narrowed by the filter/exclude regex."))
 m.pageaction = false
 
+-- Sub-nav tab bar (see custom-servers.lua for rationale).
+m:section(SimpleSection).template = "clashnivo/customize_tabs"
+
 s = m:section(TypedSection, "groups", translate("Group List"))
 s.anonymous = true
 s.addremove = true
 s.sortable = true
 s.template = "cbi/tblsection"
-s.extedit = DISP.build_url("admin/services/clashnivo/custom-groups-edit/%s")
+s.extedit = DISP.build_url("admin/services/clashnivo/customize/groups-edit/%s")
 
 function s.create(...)
 	local sid = TypedSection.create(...)

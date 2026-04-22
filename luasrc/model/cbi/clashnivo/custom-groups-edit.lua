@@ -19,7 +19,7 @@ local m, s, o
 
 m = Map("clashnivo", translate("Edit Group"))
 m.pageaction = false
-m.redirect = DISP.build_url("admin/services/clashnivo/custom-groups")
+m.redirect = DISP.build_url("admin/services/clashnivo/customize/groups")
 
 if not sid or uci:get("clashnivo", sid) ~= "groups" then
 	HTTP.redirect(m.redirect)

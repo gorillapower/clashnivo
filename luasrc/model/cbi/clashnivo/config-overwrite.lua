@@ -27,12 +27,15 @@ m = Map("clashnivo", translate("Config Overwrite"),
 	translate("Apply YAML overlays on top of the subscription config before Mihomo starts. Sources run in ascending `order`; later sources override earlier ones. Use an inline body for one-off tweaks, or point at a remote URL for community-maintained overlays."))
 m.pageaction = false
 
+-- Sub-nav tab bar (see custom-servers.lua for rationale).
+m:section(SimpleSection).template = "clashnivo/customize_tabs"
+
 s = m:section(TypedSection, "config_overwrite", translate("Overwrite Sources"))
 s.anonymous = true
 s.addremove = true
 s.sortable = true
 s.template = "cbi/tblsection"
-s.extedit = DISP.build_url("admin/services/clashnivo/config-overwrite-edit/%s")
+s.extedit = DISP.build_url("admin/services/clashnivo/customize/overwrite-edit/%s")
 
 function s.create(...)
 	local sid = TypedSection.create(...)

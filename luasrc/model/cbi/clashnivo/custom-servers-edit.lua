@@ -19,7 +19,7 @@ local m, s, o
 
 m = Map("clashnivo", translate("Edit Server"))
 m.pageaction = false
-m.redirect = DISP.build_url("admin/services/clashnivo/custom-servers")
+m.redirect = DISP.build_url("admin/services/clashnivo/customize/servers")
 
 if not sid or uci:get("clashnivo", sid) ~= "servers" then
 	HTTP.redirect(m.redirect)

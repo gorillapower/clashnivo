@@ -30,26 +30,38 @@ function index()
 	page.dependent = true
 	page.acl_depends = { "luci-app-clashnivo" }
 
-	-- Epic 1 pages
+	-- Six top-level entries, per docs/architecture/ui-nav.md §Nav Entries:
+	-- Overview, Subscriptions, Customize, Settings, Log, System.
 	entry({"admin", "services", "clashnivo", "overview"},     form("clashnivo/overview"),     _("Overview"),      10).leaf = true
-	entry({"admin", "services", "clashnivo", "settings"},     cbi("clashnivo/settings"),      _("Settings"),      20).leaf = true
-	-- Epic 2 pages
-	entry({"admin", "services", "clashnivo", "subscription"},      cbi("clashnivo/subscription"),      _("Subscriptions"), 30).leaf = true
-	entry({"admin", "services", "clashnivo", "subscription-edit"}, cbi("clashnivo/subscription-edit"), nil).leaf = true
-	entry({"admin", "services", "clashnivo", "config"},            cbi("clashnivo/config"),            _("Config Files"),  40).leaf = true
-	-- Epic 3a pages
-	entry({"admin", "services", "clashnivo", "custom-servers"},      cbi("clashnivo/custom-servers"),      _("Custom Servers"), 50).leaf = true
-	entry({"admin", "services", "clashnivo", "custom-servers-edit"}, cbi("clashnivo/custom-servers-edit"), nil).leaf = true
-	-- Epic 3b pages
-	entry({"admin", "services", "clashnivo", "custom-groups"},       cbi("clashnivo/custom-groups"),       _("Custom Groups"), 60).leaf = true
-	entry({"admin", "services", "clashnivo", "custom-groups-edit"},  cbi("clashnivo/custom-groups-edit"),  nil).leaf = true
-	-- Epic 3c pages
-	entry({"admin", "services", "clashnivo", "custom-rules"},        cbi("clashnivo/custom-rules"),        _("Custom Rules"),  70).leaf = true
-	entry({"admin", "services", "clashnivo", "custom-rules-edit"},   cbi("clashnivo/custom-rules-edit"),   nil).leaf = true
-	-- Epic 3d pages
-	entry({"admin", "services", "clashnivo", "config-overwrite"},      cbi("clashnivo/config-overwrite"),      _("Config Overwrite"), 80).leaf = true
-	entry({"admin", "services", "clashnivo", "config-overwrite-edit"}, cbi("clashnivo/config-overwrite-edit"), nil).leaf = true
-	entry({"admin", "services", "clashnivo", "log"},               cbi("clashnivo/log"),               _("Logs"),          90).leaf = true
+	entry({"admin", "services", "clashnivo", "subscription"}, cbi("clashnivo/subscription"),  _("Subscriptions"), 20).leaf = true
+
+	-- Customize: parent + four sub-nav children. Opening "Customize" aliases
+	-- to the first child so the top-level click lands on a real page.
+	entry({"admin", "services", "clashnivo", "customize"},
+		alias("admin", "services", "clashnivo", "customize", "servers"), _("Customize"), 30)
+	entry({"admin", "services", "clashnivo", "customize", "servers"},
+		cbi("clashnivo/custom-servers"), _("Servers"), 10).leaf = true
+	entry({"admin", "services", "clashnivo", "customize", "groups"},
+		cbi("clashnivo/custom-groups"), _("Groups"), 20).leaf = true
+	entry({"admin", "services", "clashnivo", "customize", "rules"},
+		cbi("clashnivo/custom-rules"), _("Rules"), 30).leaf = true
+	entry({"admin", "services", "clashnivo", "customize", "overwrite"},
+		cbi("clashnivo/config-overwrite"), _("Config Overwrite"), 40).leaf = true
+
+	entry({"admin", "services", "clashnivo", "settings"}, cbi("clashnivo/settings"), _("Settings"), 40).leaf = true
+	entry({"admin", "services", "clashnivo", "log"},      cbi("clashnivo/log"),      _("Log"),      50).leaf = true
+	entry({"admin", "services", "clashnivo", "system"},   cbi("clashnivo/system"),   _("System"),   60).leaf = true
+
+	-- Edit-page routes. Nil label keeps them out of the nav but still dispatches.
+	entry({"admin", "services", "clashnivo", "subscription-edit"},     cbi("clashnivo/subscription-edit"),     nil).leaf = true
+	entry({"admin", "services", "clashnivo", "customize", "servers-edit"},
+		cbi("clashnivo/custom-servers-edit"), nil).leaf = true
+	entry({"admin", "services", "clashnivo", "customize", "groups-edit"},
+		cbi("clashnivo/custom-groups-edit"),  nil).leaf = true
+	entry({"admin", "services", "clashnivo", "customize", "rules-edit"},
+		cbi("clashnivo/custom-rules-edit"),   nil).leaf = true
+	entry({"admin", "services", "clashnivo", "customize", "overwrite-edit"},
+		cbi("clashnivo/config-overwrite-edit"), nil).leaf = true
 
 	-- Epic 1 AJAX endpoints (implemented)
 	entry({"admin", "services", "clashnivo", "status"},            call("action_status")).leaf = true

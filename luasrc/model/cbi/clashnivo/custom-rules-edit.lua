@@ -20,7 +20,7 @@ local m, s, o
 
 m = Map("clashnivo", translate("Edit Rule Provider"))
 m.pageaction = false
-m.redirect = DISP.build_url("admin/services/clashnivo/custom-rules")
+m.redirect = DISP.build_url("admin/services/clashnivo/customize/rules")
 
 if not sid or uci:get("clashnivo", sid) ~= "rule_provider" then
 	HTTP.redirect(m.redirect)

@@ -1,0 +1,35 @@
+<%#
+Sub-nav tab bar for the four Customize pages (Servers / Groups / Rules /
+Config Overwrite). LuCI's default bootstrap theme does not render level-5
+nav entries as a second tab row, so we draw one ourselves.
+
+Styling reuses the theme's built-in `cbi-tabmenu` + `cbi-tab-disabled`
+classes so the bar looks identical to the tabs on the Settings page.
+
+Active-tab detection compares the final segment of PATH_INFO against each
+tab's slug. Keep this list in sync with the controller registrations in
+luasrc/controller/clashnivo.lua.
+%>
+<%
+local path = (luci.http.getenv("PATH_INFO") or ""):gsub("/+$", "")
+local current = path:match("([^/]+)$") or ""
+-- The alias at /customize redirects to /customize/servers, so treat the
+-- parent path as "servers" for active-state purposes.
+if current == "customize" then current = "servers" end
+
+local tabs = {
+	{ slug = "servers",   label = translate("Servers") },
+	{ slug = "groups",    label = translate("Groups") },
+	{ slug = "rules",     label = translate("Rules") },
+	{ slug = "overwrite", label = translate("Config Overwrite") },
+}
+local build_url = luci.dispatcher.build_url
+%>
+<ul class="cbi-tabmenu">
+<% for _, t in ipairs(tabs) do
+	local href   = build_url("admin", "services", "clashnivo", "customize", t.slug)
+	local active = (current == t.slug)
+%>
+	<li<% if not active then %> class="cbi-tab-disabled"<% end %>><a href="<%=href%>"><%=t.label%></a></li>
+<% end %>
+</ul>

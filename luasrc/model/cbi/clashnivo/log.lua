@@ -1,21 +1,19 @@
 --[[
-CBI entry point for the Log page. The page body is a TextValue that just
-mounts the log view; all polling and display live in view/clashnivo/log.htm.
-The config-editor template from OpenClash is Epic 3d scope and not mounted.
+Log page. Hosts the log viewer (tab per pane), log-level switcher, and the
+Clear button. All polling and rendering lives in view/clashnivo/log.htm.
+
+Structured as SimpleForm + SimpleSection so the template renders full-width.
+An earlier TextValue-wrapped version collapsed the template inside a
+cbi-value flex row, shoving the tab buttons and log panes into narrow
+columns (visible bug on 2026-04-22).
 ]]--
 
-local m = Map("clashnivo", translate("Clash Nivo Logs"))
-local s = m:section(TypedSection, "clashnivo")
-m.pageaction = false
-s.anonymous = true
-s.addremove = false
+local m = SimpleForm("clashnivo", translate("Clash Nivo Logs"))
+m.description = translate("Live log tail. Log level is set here — it takes effect on the running core via the controller API and is written to UCI for subsequent runs.")
+m.reset = false
+m.submit = false
 
-local log = s:option(TextValue, "clog")
-log.readonly = true
-log.pollcheck = true
-log.template = "clashnivo/log"
-log.description = ""
-log.rows = 29
+m:section(SimpleSection).template = "clashnivo/log"
 
 m:append(Template("clashnivo/toolbar_show"))
 

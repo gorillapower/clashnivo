@@ -1,4 +1,9 @@
-<%+cbi/valueheader%>
+<%#
+Standalone section mounted on the Custom Servers page via m:append(Template()).
+It is NOT rendered inside a CBI option, so do not pull in cbi/valueheader or
+cbi/valuefooter — those assume a `self.option` context and crash when it's
+absent.
+%>
 <div class="cbi-section">
 	<h3><%:Import From URL%></h3>
 	<div class="cbi-section-descr">
@@ -53,4 +58,3 @@
 		xhr.send('uris=' + encodeURIComponent(raw));
 	}
 //]]></script>
-<%+cbi/valuefooter%>

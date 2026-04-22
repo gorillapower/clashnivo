@@ -8,9 +8,12 @@ is a minimal two-pane viewer:
   - App Log pane: HTTP polling of refresh_log endpoint (1s)
   - Core Log pane: WebSocket to mihomo /logs when running, polling fallback
 
+Mounted from log.lua as a SimpleSection template — NOT inside a cbi-value,
+so do not include cbi/valueheader / cbi/valuefooter. Those force a flex row
+and collapse the tabs into columns.
+
 Epic 5 will revisit polish (download button, search, filtering).
 %>
-<%+cbi/valueheader%>
 
 <style>
 .cn-log-tabs { display: flex; gap: 4px; margin-bottom: 8px; }
@@ -223,4 +226,3 @@ Epic 5 will revisit polish (download button, search, filtering).
 	startCoreWs();
 })();
 //]]></script>
-<%+cbi/valuefooter%>

@@ -31,11 +31,18 @@ local PROVIDER_DIR = "/etc/clashnivo/rule_provider/"
 local m, s, o
 
 -- ---------------------------------------------------------------------------
--- Form 1: master toggle + rule_provider list
+-- Form 1: Master Switch (top of page — gates everything below)
+--
+-- Page order is authored top-down: Master Switch → Custom Rules (the most
+-- common edit) → Rule Providers → Rule-Set Files. Master Switch and Rule
+-- Providers are different UCI scopes (singleton vs list), so they live in
+-- separate Maps so we can slot the Custom Rules textarea between them.
 -- ---------------------------------------------------------------------------
 m = Map("clashnivo", translate("Custom Rules"),
 	translate("Define rule-set providers and additional Clash rules. Custom rules are prepended to the subscription's rule list so they always take precedence."))
-m.pageaction = false
+
+-- Sub-nav tab bar (see custom-servers.lua for rationale).
+m:section(SimpleSection).template = "clashnivo/customize_tabs"
 
 s = m:section(NamedSection, "config", "clashnivo", translate("Master Switch"))
 s.anonymous = true
@@ -46,14 +53,25 @@ o.description = translate("When enabled, rule-provider entries and the rule list
 o.default = "0"
 o.rmempty = false
 
--- rule_provider table
-s = m:section(TypedSection, "rule_provider", translate("Rule Providers"),
+m:append(Template("clashnivo/toolbar_show"))
+
+-- ---------------------------------------------------------------------------
+-- Form 2 (declared later as rules_form) — see below. Renders between the
+-- Master Switch and the Rule Providers table.
+-- ---------------------------------------------------------------------------
+
+-- ---------------------------------------------------------------------------
+-- Form 3: rule_provider table
+-- ---------------------------------------------------------------------------
+local providers_map = Map("clashnivo")
+
+s = providers_map:section(TypedSection, "rule_provider", translate("Rule Providers"),
 	translate("Each entry becomes an item under Mihomo's rule-providers: block. Reference them from a rule as RULE-SET,<name>,<target>."))
 s.anonymous = true
 s.addremove = true
 s.sortable = true
 s.template = "cbi/tblsection"
-s.extedit = DISP.build_url("admin/services/clashnivo/custom-rules-edit/%s")
+s.extedit = DISP.build_url("admin/services/clashnivo/customize/rules-edit/%s")
 
 function s.create(...)
 	local sid = TypedSection.create(...)
@@ -108,14 +126,20 @@ function o.cfgvalue(self, section)
 	return v
 end
 
-m:append(Template("clashnivo/toolbar_show"))
-
 -- ---------------------------------------------------------------------------
 -- Form 2: local rule-set file manager
 -- ---------------------------------------------------------------------------
 local upload_form = SimpleForm("rule_provider_upload",
 	translate("Upload Rule-Set File"),
 	translate("Upload a local rule-set body. Files are stored in /etc/clashnivo/rule_provider/ and referenced by rule_provider entries whose type is \"file\"."))
+-- embedded: render without a nested <form> tag — the outer cbi/header form
+-- wraps the whole page, so a second <form> here produces invalid HTML and
+-- splits the token input (hit as "Form token mismatch" on 2026-04-22).
+-- pageaction: SimpleForm defaults to pageaction=false (cbi.lua:694), which
+-- propagates to the whole page and hides the footer's Save & Apply. Override
+-- so the outer Map's action bar stays visible.
+upload_form.embedded = true
+upload_form.pageaction = true
 upload_form.reset = false
 upload_form.submit = false
 
@@ -164,6 +188,8 @@ for i, path in ipairs(fs.glob(PROVIDER_DIR .. "*")) do
 end
 
 local files_form = SimpleForm("rule_provider_files", translate("Local Rule-Set Files"))
+files_form.embedded = true
+files_form.pageaction = true
 files_form.reset = false
 files_form.submit = false
 
@@ -198,7 +224,7 @@ btn_rm.write = function(self, t)
 	if not row then return end
 	fs.unlink(PROVIDER_DIR .. row.name)
 	table.remove(rows, t)
-	HTTP.redirect(DISP.build_url("admin", "services", "clashnivo", "custom-rules"))
+	HTTP.redirect(DISP.build_url("admin", "services", "clashnivo", "customize", "rules"))
 end
 
 -- ---------------------------------------------------------------------------
@@ -342,6 +368,8 @@ end
 
 local rules_form = SimpleForm("custom_rules", translate("Custom Rules"),
 	translate("One rule per line. Comments with '#'. Order matters — the list is prepended to the subscription's rules so the first match wins."))
+rules_form.embedded = true
+rules_form.pageaction = true
 rules_form.reset = false
 
 local rs = rules_form:section(SimpleSection, "")
@@ -389,4 +417,6 @@ rt.remove = function(self, section)
 	return rt.write(self, section, "")
 end
 
-return m, upload_form, files_form, rules_form
+-- Render order: Master Switch (w/ sub-nav tab bar on top) → Custom Rules →
+-- Rule Providers → Upload Rule-Set File → Local Rule-Set Files.
+return m, rules_form, providers_map, upload_form, files_form

@@ -29,7 +29,7 @@ local m, s, o
 
 m = Map("clashnivo", translate("Edit Overwrite Source"))
 m.pageaction = false
-m.redirect = DISP.build_url("admin/services/clashnivo/config-overwrite")
+m.redirect = DISP.build_url("admin/services/clashnivo/customize/overwrite")
 
 if not sid or uci:get("clashnivo", sid) ~= "config_overwrite" then
 	HTTP.redirect(m.redirect)

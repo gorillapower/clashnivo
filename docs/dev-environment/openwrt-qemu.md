@@ -61,7 +61,7 @@ Save as `~/openwrt-vm/boot.sh`:
 #!/bin/sh
 qemu-system-x86_64 \
   -M q35 \
-  -cpu host -accel hvf \
+  -cpu max -accel tcg \
   -m 512 \
   -drive file=openwrt-23.05.5-x86-64-generic-ext4-combined.img,format=raw,if=virtio \
   -netdev user,id=n0,hostfwd=tcp::2222-:22,hostfwd=tcp::8080-:80 \
@@ -72,8 +72,12 @@ qemu-system-x86_64 \
 `chmod +x boot.sh`.
 
 Key flags:
-- `-accel hvf` uses Apple's Hypervisor Framework (much faster than
-  software emulation; requires Apple Silicon or Intel Mac with VT-x)
+- `-accel tcg` is software emulation. Apple's Hypervisor Framework
+  (`hvf`) only accelerates same-arch guests — an arm64 Mac cannot hvf-
+  accelerate an x86_64 guest, and an Intel Mac running this x86_64
+  image could swap in `-cpu host -accel hvf` for a large speedup.
+  Everything works under TCG; boot is just slower (tens of seconds
+  to login prompt).
 - `-netdev user` is user-mode networking: the VM can reach the internet
   through your Mac's connection, no root required, no tap interfaces
 - `hostfwd=tcp::2222-:22` forwards Mac's `localhost:2222` to the VM's
@@ -83,26 +87,45 @@ Key flags:
 - `-nographic` means no window — stdin/stdout is the VM console. Use
   Ctrl-A then X to quit. If you want a graphical console, drop this flag.
 
-### 5. First boot — set root password and enable SSH
+### 5. First boot — set root password, enable SSH, make the NIC a DHCP client
 
 ```sh
 ./boot.sh
 ```
 
-Wait for the login prompt, then:
+Wait for the login prompt, then inside the VM:
 
 ```sh
-# Inside the VM
 passwd                  # set root password
 /etc/init.d/dropbear enable
 /etc/init.d/dropbear start
+
+# OpenWrt's x86 image configures the single NIC as a static LAN (192.168.1.1).
+# Under QEMU slirp there's only one NIC and it needs to be a DHCP client to
+# pick up slirp's 10.0.2.15 lease — otherwise the hostfwd tunnel (host:2222 →
+# guest 10.0.2.15:22) has nowhere to land and SSH times out at banner exchange.
+# This is VM-only plumbing — a real OpenWrt router still wants the static LAN.
+uci set network.lan.proto='dhcp'
+uci delete network.lan.ipaddr
+uci delete network.lan.netmask
+uci commit network
+/etc/init.d/network restart
+
+# One-time opkg prereqs used by the rest of this doc (curl for Mihomo install,
+# rsync for the push helper, luci-compat for the Lua LuCI controllers).
+opkg update
+opkg install curl rsync luci-compat
 ```
 
 From another Mac terminal:
 
 ```sh
-ssh root@localhost -p 2222
+ssh root@127.0.0.1 -p 2222
 ```
+
+Use `127.0.0.1` explicitly, not `localhost` — on some Macs (Tailscale MagicDNS,
+custom `/etc/hosts`, etc.) `localhost` resolves to IPv6 `::1` first, and QEMU's
+slirp hostfwd is IPv4-only.
 
 If it works, you're set. Everything from here on you do over SSH.
 
@@ -110,29 +133,35 @@ If it works, you're set. Everything from here on you do over SSH.
 
 ### Push your tree to the VM
 
-Save as `~/dev/Personal/clashnivo/scripts/push-to-vm.sh`:
+Save as `~/dev/Personal/clashnivo/scripts/push-to-vm.sh`. This mirrors the
+install rules in the package `Makefile` — `root/* → /` and
+`luasrc/* → /usr/lib/lua/luci/` — so the LuCI app, rpcd ACL, ucitrack, and
+uci-defaults trees all land where the runtime expects them:
 
 ```sh
 #!/bin/sh
 set -e
-VM=root@localhost
+VM=root@127.0.0.1
 PORT=2222
 cd "$(git rev-parse --show-toplevel)"
 
-# Sync files. Note: no deletes — so stale files need manual cleanup.
-rsync -av -e "ssh -p $PORT" \
-  root/etc/init.d/clashnivo \
-  $VM:/etc/init.d/clashnivo
+SSH="ssh -p $PORT"
 
-rsync -av -e "ssh -p $PORT" \
-  root/usr/share/clashnivo/ \
-  $VM:/usr/share/clashnivo/
+# No deletes — stale files on the VM need manual cleanup.
 
-rsync -av -e "ssh -p $PORT" \
-  root/etc/config/clashnivo \
-  $VM:/etc/config/clashnivo 2>/dev/null || true
+rsync -a -e "$SSH" root/etc/init.d/clashnivo      $VM:/etc/init.d/clashnivo
+rsync -a -e "$SSH" root/usr/share/clashnivo/      $VM:/usr/share/clashnivo/
+rsync -a -e "$SSH" root/usr/share/rpcd/           $VM:/usr/share/rpcd/
+rsync -a -e "$SSH" root/usr/share/ucitrack/       $VM:/usr/share/ucitrack/ 2>/dev/null || true
+rsync -a -e "$SSH" root/etc/uci-defaults/         $VM:/etc/uci-defaults/ 2>/dev/null || true
+rsync -a -e "$SSH" root/etc/config/clashnivo      $VM:/etc/config/clashnivo 2>/dev/null || true
+rsync -a -e "$SSH" luasrc/                        $VM:/usr/lib/lua/luci/
 
-ssh -p $PORT $VM "chmod +x /etc/init.d/clashnivo /usr/share/clashnivo/*.sh 2>/dev/null; true"
+$SSH $VM "
+  chmod +x /etc/init.d/clashnivo /usr/share/clashnivo/*.sh 2>/dev/null
+  rm -rf /tmp/luci-* 2>/dev/null
+  true
+"
 echo "Pushed."
 ```
 
@@ -145,7 +174,7 @@ echo "Pushed."
 ./scripts/push-to-vm.sh
 
 # Then SSH in
-ssh root@localhost -p 2222
+ssh root@127.0.0.1 -p 2222
 
 # Inside the VM
 /etc/init.d/clashnivo start
@@ -157,6 +186,14 @@ uci show clashnivo        # did UCI round-trip cleanly?
 /etc/init.d/clashnivo stop
 nft list ruleset | grep clashnivo       # should be empty after stop
 ```
+
+Without a loaded profile, `start` will exit at `Step 1: Get The Configuration
+... [Error] Config Not Found` — mihomo won't launch, no nft chains will appear,
+and `pidof mihomo` will be empty. That path verifies UCI round-trip + init.d
+gating only. To exercise firewall + mihomo, set `clashnivo.config.enable=1`
+and either import a subscription through LuCI or drop a valid profile into the
+path clashnivo expects. The CLI-only test cycle above is useful for schema /
+gating / teardown verification, not for the full start path.
 
 ## Installing Mihomo inside the VM
 
@@ -182,7 +219,7 @@ install -m 755 mihomo-linux-amd64-v1.19.14 /etc/clashnivo/core/mihomo
 - Test that `revert_firewall` leaves zero residue
 - Exercise the dnsmasq snapshot/restore cycle
 - Verify Mihomo actually starts with our generated config
-- Iterate LuCI UI pages at `http://localhost:8080/cgi-bin/luci`
+- Iterate LuCI UI pages at `http://127.0.0.1:8080/cgi-bin/luci`
 
 ### Can't
 - Test MIPS-specific arch detection in `clashnivo_core.sh` (the VM is x86_64)

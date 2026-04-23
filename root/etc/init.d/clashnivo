@@ -55,7 +55,6 @@ add_cron()
    config_foreach add_overwrite_cron "config_overwrite"
 
    crontab $CRON_FILE
-   start_watchdog
 }
 
 del_cron()
@@ -2129,6 +2128,7 @@ start_service()
 
       LOG_OUT "Step 5: Add Cron Rules, Start Daemons..."
       add_cron
+      start_watchdog
 
       LOG_OUT "Step 6: Core Status Checking and Firewall Rules Setting..."
       check_core_status "start" &
@@ -2267,6 +2267,14 @@ reload_service()
    if pidof mihomo >/dev/null && [ "$enable" == "1" ] && [ "$1" == "restore" ]; then
       do_run_mode
       check_core_status
+   fi
+   # Cron refresh is intentionally ungated on enable/pidof: schedule edits
+   # (auto-update, auto-restart, geo-refresh) must take effect regardless of
+   # whether mihomo is currently running, so the schedule survives a disabled
+   # service and fires correctly when it's next enabled.
+   if [ "$1" == "cron" ]; then
+      del_cron
+      add_cron
    fi
 } >/dev/null 2>&1
 

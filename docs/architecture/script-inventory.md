@@ -174,6 +174,46 @@ dependencies dropped are `openclash_chnroute.sh`,
   127.0.0.1), but matches the intent: no proxy pointer should ever be treated
   as "original" state.
 
+### Reload / restart contract
+
+`reload_service()` dispatches on `$1` (passed via `/etc/init.d/clashnivo reload <arg>`).
+Bare `reload` — what the `ucitrack` registration fires on every `uci commit
+clashnivo` — is a deliberate no-op, matching OpenClash. Per-action branches:
+
+| Branch | Effect | Guard |
+|---|---|---|
+| `firewall` | `revert_firewall` + `do_run_mode` + async `check_core_status`. Rate-limited to 10 reloads / 5 min. | `enable=1 && pidof mihomo` |
+| `manual` | Same as `firewall` without the rate limiter. | `enable=1 && pidof mihomo` |
+| `revert` | `revert_firewall` + `revert_dnsmasq` + `SLOG_CLEAN`. | `enable=1 && pidof mihomo` |
+| `restore` | `do_run_mode` + synchronous `check_core_status`. Used by subscription refresh to reapply firewall after a config regen. | `enable=1 && pidof mihomo` |
+| `cron` | `del_cron` + `add_cron`. Rewrites `/etc/crontabs/root` entries for auto-update, auto-restart, GEO refresh, and overwrite download. | **Ungated** — schedule changes apply while the service is disabled. |
+| *(no arg)* | No-op. See rationale below. | — |
+
+**Why bare reload is a no-op** — `init.d/clashnivo` itself commits `clashnivo`
+UCI during `start_service` / `stop_service` (`save_dnsmasq_server`, `change_dns`,
+`revert_dns`, subscription traffic-counter writes). If a bare reload did real
+work, those internal commits would fire ucitrack mid-lifecycle and re-enter
+`reload_service()` while `start_service` was still setting up firewall rules.
+Classic reentrancy failure mode. Keeping bare reload dead-on-arrival means
+controllers commit UCI freely without self-triggering. This is the shape
+OpenClash arrived at and it's the safe default.
+
+**How CBI pages apply changes** — pages wire their intent explicitly:
+
+- **Tier A (rebuilds `config.yaml`, bounces mihomo):** `luci.sys.call("/etc/init.d/clashnivo restart ...")` in the page's `on_after_commit`, or a dedicated "Apply" button. Today wired in `subscription.lua`, `controller/clashnivo.lua` (set-active-config action). Must be wired by Epic 5 for Settings pages that touch ports, DNS, mihomo feature flags, dashboard/binary keys, custom-servers/-groups/-rules, and config-overwrite.
+- **Tier B (firewall-only — mihomo stays up):** `reload firewall` (or `reload manual` to bypass the rate limiter). For LAN AC pages.
+- **Tier C (cron-only — no service disruption):** `reload cron`. For auto-restart schedule, subscription auto-update schedule, GEO auto-update schedule.
+
+See `uci-schema.md` §1 for the per-key tier mapping by pipeline stage.
+
+**ucitrack packaging** — registration is duplicated across two mechanisms for
+LuCI-version compatibility: `uci-defaults/luci-clashnivo` writes the
+`/etc/config/ucitrack` entry at first boot, and
+`root/usr/share/ucitrack/luci-app-clashnivo.json` ships the JSON form for LuCI
+builds that only read the JSON path. Same content (`config: clashnivo`,
+`init: clashnivo`). The bare-reload no-op means both registrations are harmless
+if both fire.
+
 ---
 
 ## 2. `clashnivo.sh` (fork of `openclash.sh`)
